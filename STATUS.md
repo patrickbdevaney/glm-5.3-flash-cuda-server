@@ -21,7 +21,7 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **complete decoder layer 0** | **gated cosine-1.0**, 12/12 end-to-end — `tests/gate_layer.cu` |
 | **MLA full attention** (13.1%) | **gated cosine-1.0**, 4/4 — `tests/gate_mla.cu` |
 | DSA indexer (0.8%) | not started — **only needed above 2048 context** (verified) |
-| engine (45 layers + lm_head) | not started |
+| **engine** (45 layers + lm_head) | **written and gated** — `tests/gate_stack.cu`, 4 decode steps cos 1.000000000 across 3 layers |
 | tokenizer / HTTP server | not started (ports from `0731`) |
 | MTP + speculative decode | not started |
 
@@ -42,13 +42,14 @@ that already exists and needs wiring, and the DSA indexer, which does not affect
 
 ## Next
 
-1. **Engine**: embed → 45 layers → HyperHead mean → final norm → lm_head. Every kernel it needs
-   for context <= 2048 now exists and is gated. This is the next milestone and it is a wiring
-   job, not a kernel job.
-2. **Server**: tokenizer (GLM vocab 154 880, three EOS ids), HTTP/OpenAI, SSE — ports from `0731`.
-3. **DSA indexer**, to go past 2048 context. k-pooling (`kpool` 4 + compress gate + APE) is new;
+1. **Widen the stack gate to layer 3**, which covers MLA and MoE *inside the engine loop* — both
+   are gated standalone but their wiring is not. Blocked only on memory: the oracle needs ~20 GiB
+   for layer 3's experts and an unattended stage currently holds 64 GiB.
+2. **Run the full 45-layer engine.** Needs ~98 GiB free; same blocker.
+3. **Server**: tokenizer (GLM vocab 154 880, three EOS ids), HTTP/OpenAI, SSE — ports from `0731`.
+4. **DSA indexer**, to go past 2048 context. k-pooling (`kpool` 4 + compress gate + APE) is new;
    `index_topk` is 2048, not 512.
-4. **Then, and only then, speculation** — with the batch-cost curve measured first, because that
+5. **Then, and only then, speculation** — with the batch-cost curve measured first, because that
    is what decided it on GGUF.
 
 ## Two things the build has already changed

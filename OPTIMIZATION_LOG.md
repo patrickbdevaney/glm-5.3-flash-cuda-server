@@ -127,3 +127,33 @@ cache is read once per block**. The obvious layout — one block per (head, toke
 times, which at 8k context is 268 MB per layer per token instead of 16 MB. `k_context` uses
 head-groups of 16 for the same reason (4x amplification instead of 64x). Neither is measured yet;
 both are structural choices made to avoid a known-bad access pattern, and the ladder stays open.
+
+---
+
+## #4 — The engine runs, and its wiring gates (2026-09-04)
+
+`tests/gate_stack.cu` drives the **Engine itself** — not a kernel — over four successive decode
+steps and compares the four mHC residual streams against `transformers`:
+
+```
+engine: 81 tensors, 10.26 GiB resident, 3 layers, max_ctx 2048
+engine: 3 KDA layers (12.84 MiB state, context-independent), 0 full-attn layers
+  step 0 tok  7321  PASS  cos 1.000000000  max_rel 1.694e-06
+  step 1 tok 32959  PASS  cos 1.000000000  max_rel 1.710e-06
+  step 2 tok 10320  PASS  cos 1.000000000  max_rel 1.847e-06
+  step 3 tok 48987  PASS  cos 1.000000000  max_rel 1.384e-06
+```
+
+Four steps matter more than one: step 0 would pass even if every KDA layer shared a single
+recurrent state, or if the conv window never advanced. Steps 1–3 only stay at cosine 1.0 if each
+layer keeps its own state and advances it correctly.
+
+**What this does NOT yet cover, and it should be said plainly:** layers 0–2 are all KDA with a
+dense MLP, so this gate exercises neither MLA nor MoE *inside the engine* — both are gated
+standalone (#2, #3) but their wiring into the layer loop is not. Extending the stack gate to layer
+3 covers both. It is not run yet because the oracle must materialise layer 3's 144 NVFP4 experts
+as fp32 (~20 GiB) and the box currently has 38 GiB available with an unattended trace-extraction
+stage holding 64 GiB. Running it now risks OOM-killing a job that has been going for hours, which
+is not a trade worth making for a gate that can run in an hour.
+
+**Also owed:** the full 45-layer load (98 GiB) cannot be attempted until that stage finishes.
