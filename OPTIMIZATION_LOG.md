@@ -157,3 +157,55 @@ stage holding 64 GiB. Running it now risks OOM-killing a job that has been going
 is not a trade worth making for a gate that can run in an hour.
 
 **Also owed:** the full 45-layer load (98 GiB) cannot be attempted until that stage finishes.
+
+---
+
+## #5 — The 51% `B_tok` lever converts (2026-09-04)
+
+`tools/dense_nvfp4_probe.py` round-trips layer 0's bf16 dense weights through the NVFP4 grid the
+checkpoint already uses (per-group-of-16 fp8-e4m3 scale, one fp32 global scale, e2m1 values) and
+measures what it does to the **output**, not just to the weights.
+
+```
+tensor                      rel err          cos   MB saved/tok
+kda q_proj                  0.09516    0.9954803         48.2
+kda k_proj                  0.09584    0.9954364         48.2
+kda v_proj                  0.09387    0.9955958         48.2
+kda o_proj                  0.09496    0.9955014         48.2
+kda f_b / g_b               0.0951     0.99547            1.5 each
+dense gate / up / down      0.093      0.99566           72.4 each
+
+layer output   rel err 0.00127   cos 0.9999992
+KDA state      rel err 0.06819   cos 0.9976720   (after 64 tokens of accumulation)
+```
+
+**Two things this settles.**
+
+1. **Error cancels, hard.** Individual weights lose ~9.5% relative accuracy, but the *layer
+   output* comes back at **cosine 0.9999992** — three orders of magnitude better than the weights
+   that produced it. Dot products over 4096 dimensions average independent quantisation noise
+   away. This is with **every** dense weight in the layer quantised at once, not one family.
+
+2. **The recurrence is NOT amplifying the error**, which was the specific worry — upstream warns
+   KDA states are "susceptible to rounding errors", and `q/k/v_proj` feed a recurrence that
+   accumulates over the whole sequence. After 64 tokens the state sits at cosine **0.9977**,
+   *better* than the 0.9955 of the weights that drive it, and the gated RMSNorm after the
+   recurrence absorbs most of what remains before it reaches the output.
+
+So the plan in `ROOFLINE.md` §3 — quantise `lm_head` → `o_proj` → `q/k/v` and gate at each step —
+is more conservative than the evidence requires. The evidence supports quantising the whole dense
+set, with the per-step gating kept as a check rather than as a staged retreat.
+
+**Owed before acting on it.** This is one layer and one 64-token prefill. Two things could still
+bite: 45 layers of drift compounding, which only a perplexity run over the full stack will show;
+and longer contexts, since the state was measured only at 64 tokens and the question is whether
+0.9977 is a floor or a slope. Neither can run until the box frees up. **No checkpoint has been
+modified and nothing has been written** — the probe is read-only by design.
+
+### A process note worth keeping
+
+Cleaning up the probe, `pkill -f "[d]ense_nvfp4_probe"` killed the calling shell. The bracket
+trick prevents a pattern from matching *itself*, but it does nothing when the same command line
+also contains the literal string elsewhere — here the path `tools/dense_nvfp4_probe.py`. The rule
+is narrower than "use brackets": **do not pkill a pattern that appears anywhere in your own
+command line.** Kill by PID, or run the pkill from a command that does not name the target.

@@ -116,7 +116,8 @@ def main():
                             for _ in range(a.layer + 1)]
                 s._h = [False] * (a.layer + 1)
             def has_previous_state(s, i): return s._h[i]
-            def update_conv_state(s, m, i, k):
+            def update_conv_state(s, m, i, conv_kernel_size):
+                k = conv_kernel_size
                 st = s.layers[i].conv_states[0]
                 if st is None:
                     st = torch.zeros(m.shape[0], m.shape[1], k - 1, device=m.device, dtype=m.dtype)
