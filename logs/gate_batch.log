@@ -1,0 +1,21 @@
+=== gate_batch (4 layers) ===
+engine: 1410 tensors, 13.57 GiB resident, 4 layers, max_ctx 256
+engine: 3 KDA layers (12.84 MiB state, context-independent), 1 full-attn layers (0.50 MiB latent cache at 256 ctx)
+layer types in range: 0=kda/dense 1=kda/dense 2=kda/dense 3=mla/moe 
+reference: 12 sequential decodes done
+  ok   K=1
+  ok   K=2
+  ok   K=3
+  ok   K=4
+  ok   K=5
+  ok   K=8
+  ok   ragged widths
+  ok   last-token-only logits match
+  ok   a batched prefill leaves a usable state
+  ok   accept 0 of 5
+  ok   accept 1 of 5
+  ok   accept 3 of 5
+  ok   accept 5 of 5
+--- 13 passed, 0 failed ---
+ALL BATCH GATES PASS
+RC=0
