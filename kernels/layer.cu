@@ -24,6 +24,7 @@ static constexpr int HCD = HC_HCD;        // 16384
 
 size_t hc_workspace_floats() { return MIX; }
 size_t dense_mlp_workspace_floats() { return 2 * (size_t)DENSE_INTER; }
+size_t dense_mlp_batch_workspace_floats(int B) { return 2 * (size_t)B * DENSE_INTER; }
 
 // mix[m] = sum_j (streams[j] * rsqrt(mean(streams^2) + eps)) * fn[m][j]
 //
@@ -201,6 +202,18 @@ void dense_mlp(const float* x, const DenseMlp& M, float* y, float* ws, cudaStrea
     gemv(u, M.up,   x, M.inter, HIDDEN, M.dtype, s);
     k_swiglu_clamped<<<(M.inter + 255) / 256, 256, 0, s>>>(g, g, u, M.inter, SWIGLU_LIMIT);
     gemv(y, M.down, g, HIDDEN, M.inter, M.dtype, s);
+}
+
+void dense_mlp_batch(const float* x, const DenseMlp& M, float* y, float* ws, int B, cudaStream_t s) {
+    const size_t BI = (size_t)B * M.inter;
+    float* g = ws;
+    float* u = ws + BI;
+    gemm(g, M.gate, x, B, M.inter, HIDDEN, M.dtype, s);
+    gemm(u, M.up,   x, B, M.inter, HIDDEN, M.dtype, s);
+    // The clamp is asymmetric — gate is min()'d at +10, up is clamped both ways. k_swiglu_clamped
+    // holds that; it is elementwise, so one launch covers the whole batch.
+    k_swiglu_clamped<<<(int)((BI + 255) / 256), 256, 0, s>>>(g, g, u, (int)BI, SWIGLU_LIMIT);
+    gemm(y, M.down, g, B, HIDDEN, M.inter, M.dtype, s);
 }
 
 }  // namespace glm5

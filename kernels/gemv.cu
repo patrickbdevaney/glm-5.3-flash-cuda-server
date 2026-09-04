@@ -163,3 +163,203 @@ void f32_from_bf16_dev(float* dst, const void* src, size_t n, cudaStream_t s) {
     k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(dst, (const __nv_bfloat16*)src, n);
 }
 }
+
+// ---- batched: W read once for M rows of x ------------------------------------------------------
+//
+// Same loop order and same reduction tree as the batch-1 kernels above, so M=1 is bit-identical to
+// gemv. That is a requirement, not a nicety: speculative verification compares a batched forward
+// against what the sequential path would have produced, and "close" is not a comparison.
+//
+// MB is a COMPILE-TIME batch. A runtime-bounded loop over the accumulator array spills it to local
+// memory and the kernel stops being bandwidth-bound, which is the entire reason this exists.
+namespace glm5 {
+
+template <int BS, int MB>
+__global__ void k_gemm_f32(float* __restrict__ y, const float* __restrict__ W,
+                           const float* __restrict__ x, int N, int K) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const float4* Wr = reinterpret_cast<const float4*>(W + (size_t)n * K);
+    const int K4 = K >> 2;
+    float acc[MB];
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.f;
+    for (int i = threadIdx.x; i < K4; i += BS) {
+        const float4 w = Wr[i];
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            const float4 xx = reinterpret_cast<const float4*>(x + (size_t)m * K)[i];
+            acc[m] += w.x * xx.x + w.y * xx.y + w.z * xx.z + w.w * xx.w;
+        }
+    }
+    for (int i = (K4 << 2) + threadIdx.x; i < K; i += BS) {
+        const float w = W[(size_t)n * K + i];
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) acc[m] += w * x[(size_t)m * K + i];
+    }
+    __shared__ float red[BS / 32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float a = acc[m];
+        for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+        if (lane == 0) red[warp] = a;
+        __syncthreads();
+        if (warp == 0) {
+            a = (lane < BS / 32) ? red[lane] : 0.f;
+            for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+            if (lane == 0) y[(size_t)m * N + n] = a;
+        }
+        __syncthreads();                      // red[] is reused by the next m
+    }
+}
+
+template <int BS, int MB>
+__global__ void k_gemm_bf16(float* __restrict__ y, const __nv_bfloat16* __restrict__ W,
+                            const float* __restrict__ x, int N, int K) {
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const float4* Wr = reinterpret_cast<const float4*>(W + (size_t)n * K);
+    const int K8 = K >> 3;
+    float acc[MB];
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.f;
+    for (int i = threadIdx.x; i < K8; i += BS) {
+        float4 raw = Wr[i];
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        float wf[8];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __bfloat1622float2(h[j]);
+            wf[j * 2] = f.x; wf[j * 2 + 1] = f.y;
+        }
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            const float* xp = x + (size_t)m * K + (i << 3);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) acc[m] += wf[j * 2] * xp[j * 2] + wf[j * 2 + 1] * xp[j * 2 + 1];
+        }
+    }
+    for (int i = (K8 << 3) + threadIdx.x; i < K; i += BS) {
+        const float w = __bfloat162float(W[(size_t)n * K + i]);
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) acc[m] += w * x[(size_t)m * K + i];
+    }
+    __shared__ float red[BS / 32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float a = acc[m];
+        for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+        if (lane == 0) red[warp] = a;
+        __syncthreads();
+        if (warp == 0) {
+            a = (lane < BS / 32) ? red[lane] : 0.f;
+            for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+            if (lane == 0) y[(size_t)m * N + n] = a;
+        }
+        __syncthreads();
+    }
+}
+
+// Scalar variants for checkpoint tensors the 16-byte path cannot legally touch (see vec16_ok).
+template <int BS, int MB>
+__global__ void k_gemm_f32_scalar(float* __restrict__ y, const float* __restrict__ W,
+                                  const float* __restrict__ x, int N, int K) {
+    const int n = blockIdx.x;
+    const float* Wr = W + (size_t)n * K;
+    float acc[MB];
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.f;
+    for (int i = threadIdx.x; i < K; i += BS) {
+        const float w = Wr[i];
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) acc[m] += w * x[(size_t)m * K + i];
+    }
+    __shared__ float red[BS / 32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float a = acc[m];
+        for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+        if (lane == 0) red[warp] = a;
+        __syncthreads();
+        if (warp == 0) {
+            a = (lane < BS / 32) ? red[lane] : 0.f;
+            for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+            if (lane == 0) y[(size_t)m * N + n] = a;
+        }
+        __syncthreads();
+    }
+}
+
+template <int BS, int MB>
+__global__ void k_gemm_bf16_scalar(float* __restrict__ y, const __nv_bfloat16* __restrict__ W,
+                                   const float* __restrict__ x, int N, int K) {
+    const int n = blockIdx.x;
+    const __nv_bfloat16* Wr = W + (size_t)n * K;
+    float acc[MB];
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) acc[m] = 0.f;
+    for (int i = threadIdx.x; i < K; i += BS) {
+        const float w = __bfloat162float(Wr[i]);
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) acc[m] += w * x[(size_t)m * K + i];
+    }
+    __shared__ float red[BS / 32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int m = 0; m < MB; ++m) {
+        float a = acc[m];
+        for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+        if (lane == 0) red[warp] = a;
+        __syncthreads();
+        if (warp == 0) {
+            a = (lane < BS / 32) ? red[lane] : 0.f;
+            for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+            if (lane == 0) y[(size_t)m * N + n] = a;
+        }
+        __syncthreads();
+    }
+}
+
+#define GEMM_LAUNCH(MB)                                                                       \
+    do {                                                                                      \
+        if (dtype == GEMV_F32) {                                                              \
+            if (vok) k_gemm_f32<BS, MB><<<N, BS, 0, s>>>(yc, (const float*)W, xc, N, K);       \
+            else     k_gemm_f32_scalar<BS, MB><<<N, BS, 0, s>>>(yc, (const float*)W, xc, N, K);\
+        } else {                                                                              \
+            if (vok) k_gemm_bf16<BS, MB><<<N, BS, 0, s>>>(yc, (const __nv_bfloat16*)W, xc, N, K); \
+            else     k_gemm_bf16_scalar<BS, MB><<<N, BS, 0, s>>>(yc, (const __nv_bfloat16*)W, xc, N, K); \
+        }                                                                                     \
+    } while (0)
+
+void gemm(float* y, const void* W, const float* x, int M, int N, int K, int dtype, cudaStream_t s) {
+    constexpr int BS = 256;
+    const bool vok = vec16_ok(W, K, dtype == GEMV_F32 ? 4 : 2);
+    int done = 0;
+    while (done < M) {
+        const int rem = M - done;
+        // Largest exact instantiation that fits. Anything not covered splits into these, which
+        // re-reads W per chunk — the same cost the caller would have paid without batching.
+        const int c = rem >= 32 ? 32 : rem >= 16 ? 16 : rem >= 8 ? 8 : rem;
+        float* yc = y + (size_t)done * N;
+        const float* xc = x + (size_t)done * K;
+        switch (c) {
+            case 1:  GEMM_LAUNCH(1);  break;
+            case 2:  GEMM_LAUNCH(2);  break;
+            case 3:  GEMM_LAUNCH(3);  break;
+            case 4:  GEMM_LAUNCH(4);  break;
+            case 5:  GEMM_LAUNCH(5);  break;
+            case 6:  GEMM_LAUNCH(6);  break;
+            case 7:  GEMM_LAUNCH(7);  break;
+            case 8:  GEMM_LAUNCH(8);  break;
+            case 16: GEMM_LAUNCH(16); break;
+            default: GEMM_LAUNCH(32); break;
+        }
+        done += c;
+    }
+}
+#undef GEMM_LAUNCH
+
+}  // namespace glm5

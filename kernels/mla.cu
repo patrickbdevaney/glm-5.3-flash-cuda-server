@@ -40,6 +40,13 @@ size_t mla_workspace_floats(int max_ctx) {
          + (size_t)Hh * Lk + (size_t)Hh * Dv;
 }
 
+// Per-token buffers scale with M; the attention scratch (qa/scores/ctx) does not, because the
+// attention loops one token at a time.
+size_t mla_batch_workspace_floats(int max_ctx, int M) {
+    return (size_t)M * (MLA_Q_LORA + MLA_Q_DIM + Lk + (size_t)Hh * Dv)
+         + (size_t)Hh * Lk + (size_t)Hh * max_ctx + (size_t)Hh * Lk;
+}
+
 // qa[h][l] = sum_{d<256} q[h][d] * kv_b[(h*512 + d)*512 + l]
 // One block per head, 512 threads, thread l owns output column l. For a fixed d all 512 threads
 // read 512 consecutive bf16 — one fully-coalesced 1 KB row per step.
@@ -172,6 +179,47 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
     k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
     k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
     gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
+}
+
+void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0, int M,
+                    int max_ctx, float* y, float* ws, cudaStream_t s) {
+    float* q_resid = ws;                                        // [M, 1536]
+    float* q       = q_resid + (size_t)M * MLA_Q_LORA;          // [M, 16384]
+    float* c_new   = q + (size_t)M * MLA_Q_DIM;                 // [M, 512]
+    float* heads   = c_new + (size_t)M * Lk;                    // [M, 16384]
+    float* qa      = heads + (size_t)M * Hh * Dv;               // [64, 512]  one token at a time
+    float* scores  = qa + (size_t)Hh * Lk;                      // [64, max_ctx]
+    float* ctx     = scores + (size_t)Hh * max_ctx;             // [64, 512]
+    const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));   // 1/16
+
+    gemm(q_resid, W.q_a, x, M, MLA_Q_LORA, HIDDEN, W.dtype, s);
+    for (int m = 0; m < M; ++m)
+        rmsnorm(q_resid + (size_t)m * MLA_Q_LORA, q_resid + (size_t)m * MLA_Q_LORA,
+                W.q_a_norm, W.dtype, MLA_Q_LORA, s);
+    gemm(q, W.q_b, q_resid, M, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+
+    gemm(c_new, W.kv_a, x, M, Lk, HIDDEN, W.dtype, s);
+    for (int m = 0; m < M; ++m)
+        rmsnorm(c_new + (size_t)m * Lk, c_new + (size_t)m * Lk, W.kv_a_norm, W.dtype, Lk, s);
+
+    // Every latent lands in the cache BEFORE any attention reads it — see the header note on
+    // causality within the batch.
+    for (int m = 0; m < M; ++m)
+        k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new + (size_t)m * Lk, pos0 + m);
+
+    for (int m = 0; m < M; ++m) {
+        const int n_tok = pos0 + m + 1;
+        k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q + (size_t)m * MLA_Q_DIM, (const __nv_bfloat16*)W.kv_b);
+        constexpr int TT = 8;
+        k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+        k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
+        constexpr int HG = 16;
+        k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+        k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads + (size_t)m * Hh * Dv, ctx,
+                                                (const __nv_bfloat16*)W.kv_b);
+    }
+
+    gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);
 }
 
 }  // namespace glm5

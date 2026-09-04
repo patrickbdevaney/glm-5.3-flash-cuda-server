@@ -29,11 +29,25 @@ struct KdaWeights {
 };
 
 size_t kda_workspace_floats();
+size_t kda_batch_workspace_floats(int M);
 
 // x [HIDDEN] fp32 -> y [HIDDEN] fp32
 void kda_decode_step(const float* x, const KdaWeights& W,
                      float* conv_state, float* S, float* y, float* ws,
                      cudaStream_t stream);
+
+// M tokens through one KDA layer in one pass.
+//
+// Only the PROJECTIONS are batched — they are the bandwidth (9.366 G/token, 47.4% of B_tok) and a
+// gemm reads them once for all M. The conv window and the delta-rule recurrence stay strictly
+// sequential over m, because they are a recurrence: token m's state is token m-1's output. The
+// state read is therefore paid M times (145.56 MiB per token, ~4% of a 4-wide forward) — a chunked
+// parallel scan would remove that, and is not worth writing until it is the largest term.
+//
+// x and y are [M, HIDDEN] row-major. Results are BIT-IDENTICAL to M sequential kda_decode_step
+// calls; tests/gate_batch.cu checks exactly that.
+void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, float* S,
+                    float* y, float* ws, int M, cudaStream_t stream);
 
 // Individually gateable stages, exposed so tests/gate_kda.cu can bisect a failure to one stage
 // instead of reporting "the layer is wrong".

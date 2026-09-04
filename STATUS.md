@@ -22,8 +22,12 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **MLA full attention** (13.1%) | **gated cosine-1.0**, 4/4 — `tests/gate_mla.cu` |
 | DSA indexer (0.8%) | not started — **only needed above 2048 context** (verified) |
 | **engine** (45 layers + lm_head) | **written and gated** — `tests/gate_stack.cu`, 4 decode steps cos 1.000000000 across 3 layers |
-| tokenizer / HTTP server | not started (ports from `0731`) |
-| MTP + speculative decode | not started |
+| **multi-token forward** | **gated BIT-EXACT** vs the sequential path, 9/9 — `tests/gate_batch.cu`, at 4 layers so MLA and MoE run inside the engine loop |
+| **tokenizer** | **gated id-exact vs HF**, 170/170 — `tests/gate_tokenizer.cpp` |
+| **chat encoder** | **gated byte-exact vs HF's own Jinja**, 42/42 — `tests/gate_encoding.cpp` |
+| **sampler / stream / API** | **gated**, 44 checks, no GPU needed |
+| **HTTP server** | **running** — OpenAI chat + completions, SSE, tools, prefix reuse; 19/19 live smoke |
+| MTP + speculative decode | designed and costed, not built — `SPEC_DECODE.md` |
 
 **92.9% of per-token bandwidth is now implemented and gated against `transformers` on real
 checkpoint weights.** Everything remaining on the AR path is `lm_head` (6.4%), which is a gemv
@@ -42,15 +46,19 @@ that already exists and needs wiring, and the DSA indexer, which does not affect
 
 ## Next
 
-1. **Widen the stack gate to layer 3**, which covers MLA and MoE *inside the engine loop* — both
-   are gated standalone but their wiring is not. Blocked only on memory: the oracle needs ~20 GiB
-   for layer 3's experts and an unattended stage currently holds 64 GiB.
-2. **Run the full 45-layer engine.** Needs ~98 GiB free; same blocker.
-3. **Server**: tokenizer (GLM vocab 154 880, three EOS ids), HTTP/OpenAI, SSE — ports from `0731`.
-4. **DSA indexer**, to go past 2048 context. k-pooling (`kpool` 4 + compress gate + APE) is new;
+1. **Run the full 45-layer engine.** Needs ~98 GiB free; an unattended trace extraction holds ~77
+   GiB and finishes around chunk 80 of 80. Everything below marked *blocked* waits on this.
+2. **Widen `gate_stack` to layer 3** against the PyTorch oracle — *blocked*, the oracle needs ~20
+   GiB for layer 3's experts. Note `gate_batch` now runs MLA and MoE inside the engine loop, so
+   what remains uncovered is their absolute wiring, not their consistency.
+3. **Speculative decode**, per `SPEC_DECODE.md`. Step 1 there — in/out state pointers so the KDA
+   recurrence can be rolled back for free — is **not** blocked. Steps 2-4 are.
+4. **Resolve pre-norm vs post-norm for the MTP block's `h_prev`** before any head fine-tuning. Two
+   lines, and getting it wrong would be baked into the fine-tune (`SPEC_DECODE.md`).
+5. **DSA indexer**, to go past 2048 context. k-pooling (`kpool` 4 + compress gate + APE) is new;
    `index_topk` is 2048, not 512.
-5. **Then, and only then, speculation** — with the batch-cost curve measured first, because that
-   is what decided it on GGUF.
+6. **Batch the routed experts** — worth 4.7% at verify widths, 1.9x for wide prefill chunks. Do it
+   for prefill, not for speculation.
 
 ## Two things the build has already changed
 

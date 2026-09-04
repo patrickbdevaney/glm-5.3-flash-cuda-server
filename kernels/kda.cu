@@ -46,6 +46,7 @@ static constexpr int CS = KDA_CONV_STATE; // 3
 // [8Q+256+H] core    Q
 // [9Q+256+H] normed  Q
 size_t kda_workspace_floats() { return 10 * (size_t)Q + 256 + H; }
+size_t kda_batch_workspace_floats(int M) { return (size_t)M * (13 * (size_t)Q + 256 + H); }
 
 // ---------------------------------------------------------------- conv + silu
 // Depthwise causal conv, kernel 4, one channel per thread. The rolling window lives in
@@ -264,6 +265,82 @@ void kda_decode_step(const float* x, const KdaWeights& W, float* conv_state, flo
     kda_recurrence(q_n, k_n, qkv + 2 * Q, g, beta, S, core, s);
     kda_out_norm(core, gate, W.o_norm, W.dtype, normed, s);
     gemv(y, W.o_proj, normed, HIDDEN, Q, W.dtype, s);
+}
+
+// ---- batched -----------------------------------------------------------------------------------
+
+// q,k,v arrive from three separate gemms as [M,Q] each; the conv wants one contiguous [3Q] window
+// per token, in q,k,v order, to match the reference's single [24576, 1, 4] weight.
+__global__ void k_interleave_qkv(float* __restrict__ out, const float* __restrict__ qb,
+                                 const float* __restrict__ kb, const float* __restrict__ vb,
+                                 int M) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * Q) return;
+    const int m = (int)(i / Q), c = (int)(i % Q);
+    float* o = out + (size_t)m * 3 * Q;
+    o[c]         = qb[i];
+    o[Q + c]     = kb[i];
+    o[2 * Q + c] = vb[i];
+}
+
+// f_hi and dt_bias are per-channel; A_log is per-head. Same arithmetic as k_forget_gate, indexed
+// so one launch covers all M tokens.
+__global__ void k_forget_gate_batch(float* __restrict__ g, const float* __restrict__ f_hi,
+                                    const float* __restrict__ dt_bias, const float* __restrict__ A_log,
+                                    int M) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * Q) return;
+    const int c = (int)(i % Q);
+    const float decay = __expf(A_log[c / D]);
+    const float v = decay * (f_hi[i] + dt_bias[c]);
+    g[i] = KDA_LOWER_BOUND / (1.f + __expf(-v));
+}
+
+void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, float* S,
+                    float* y, float* ws, int M, cudaStream_t s) {
+    const size_t MQ = (size_t)M * Q;
+    float* qb     = ws;
+    float* kb     = ws + MQ;
+    float* vb     = ws + 2 * MQ;
+    float* q3     = ws + 3 * MQ;          // [M, 3Q] interleaved, conv runs in place on it
+    float* f_hi   = ws + 6 * MQ;
+    float* gate   = ws + 7 * MQ;
+    float* g      = ws + 8 * MQ;
+    float* q_n    = ws + 9 * MQ;
+    float* k_n    = ws + 10 * MQ;
+    float* core   = ws + 11 * MQ;
+    float* normed = ws + 12 * MQ;
+    float* f_lo   = ws + 13 * MQ;
+    float* g_lo   = f_lo + (size_t)M * KDA_GATE_RANK;
+    float* beta   = g_lo + (size_t)M * KDA_GATE_RANK;
+
+    // ---- batched: every weight read happens here, once for all M ----
+    gemm(qb, W.q_proj, x, M, Q, HIDDEN, W.dtype, s);
+    gemm(kb, W.k_proj, x, M, Q, HIDDEN, W.dtype, s);
+    gemm(vb, W.v_proj, x, M, Q, HIDDEN, W.dtype, s);
+    k_interleave_qkv<<<(int)((MQ + 255) / 256), 256, 0, s>>>(q3, qb, kb, vb, M);
+
+    gemm(f_lo, W.f_a, x, M, KDA_GATE_RANK, HIDDEN, W.dtype, s);
+    gemm(g_lo, W.g_a, x, M, KDA_GATE_RANK, HIDDEN, W.dtype, s);
+    gemm(f_hi, W.f_b, f_lo, M, Q, KDA_GATE_RANK, W.dtype, s);
+    gemm(gate, W.g_b, g_lo, M, Q, KDA_GATE_RANK, W.dtype, s);
+    k_forget_gate_batch<<<(int)((MQ + 255) / 256), 256, 0, s>>>(g, f_hi, W.dt_bias, W.A_log, M);
+    gemm(beta, W.b_proj, x, M, H, HIDDEN, W.dtype, s);
+    k_sigmoid<<<(M * H + 255) / 256, 256, 0, s>>>(beta, beta, M * H);
+
+    // ---- sequential: the conv window and the recurrence carry state from token to token ----
+    for (int m = 0; m < M; ++m) {
+        float* qkv_m = q3 + (size_t)m * 3 * Q;
+        k_conv_silu<<<(3 * Q + 255) / 256, 256, 0, s>>>(qkv_m, conv_state, qkv_m,
+                                                        (const float*)W.conv1d, 3 * Q);
+        k_l2norm<<<H, D, 0, s>>>(q_n + (size_t)m * Q, k_n + (size_t)m * Q, qkv_m);
+        kda_recurrence(q_n + (size_t)m * Q, k_n + (size_t)m * Q, qkv_m + 2 * Q,
+                       g + (size_t)m * Q, beta + (size_t)m * H, S, core + (size_t)m * Q, s);
+        kda_out_norm(core + (size_t)m * Q, gate + (size_t)m * Q, W.o_norm, W.dtype,
+                     normed + (size_t)m * Q, s);
+    }
+
+    gemm(y, W.o_proj, normed, M, HIDDEN, Q, W.dtype, s);
 }
 
 }  // namespace glm5

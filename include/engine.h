@@ -20,6 +20,9 @@ struct EngineConfig {
     std::string model_dir;
     int  max_ctx    = 2048;   // dense MLA is EXACT to 2048; beyond that the DSA indexer is required
     int  n_layer    = N_LAYER;
+    // Widest multi-token forward the engine will run: the prefill chunk, and the ceiling on
+    // speculative verify width. Sizes the batch activation buffers, so it must be set before load.
+    int  max_batch  = 16;
     bool verbose    = true;
 };
 
@@ -55,6 +58,22 @@ public:
     // Prefill only, leaving the sequence state at the end of `ids`. Returns the logits for the
     // last token in `logits_out` (host, VOCAB floats) if non-null.
     int prefill(const std::vector<int>& ids, float* logits_out = nullptr);
+
+    // M tokens in ONE forward, at positions pos0 .. pos0+M-1.
+    //
+    // This is the kernel the whole repo turns on. Weights are read ONCE for all M — a K-wide
+    // forward costs 15.005 G plus whichever routed experts the K tokens select, not K x 19.76 G
+    // (ROOFLINE.md §4). It is what makes prefill affordable AND what makes speculative
+    // verification cheaper than just decoding the tokens, which is the only reason a draft head
+    // can pay for itself.
+    //
+    // Results are BIT-IDENTICAL to M sequential decode() calls — gate_batch.cu asserts equality,
+    // not closeness, because a verify that merely approximates the AR path is not lossless.
+    //
+    // `logits` is [M, VOCAB] when all_logits, else [VOCAB] for the last token only; nullptr skips
+    // lm_head entirely (6.4% of B_tok saved on every prefill chunk but the last).
+    void forward_batch(const int* tokens, int M, int pos0, float* logits, bool all_logits,
+                       cudaStream_t s = 0);
 
     // One decode step at position `pos` (0-based). Writes logits [VOCAB] fp32 to `logits`.
     // Advances the KDA recurrent state and the MLA latent cache in place.
@@ -112,6 +131,20 @@ private:
     float* selw_    = nullptr;
 
     // sequence state
+    // batch activations, sized for cfg_.max_batch
+    float* b_streams_ = nullptr;  // [B, HC_MULT, HIDDEN]
+    float* b_resid_   = nullptr;
+    float* b_coll_    = nullptr;  // [B, HIDDEN]
+    float* b_normed_  = nullptr;
+    float* b_sub_     = nullptr;
+    float* b_pooled_  = nullptr;
+    float* b_post_    = nullptr;  // [B, HC_MULT]
+    float* b_comb_    = nullptr;  // [B, HC_MULT*HC_MULT]
+    float* b_hcws_    = nullptr;
+    float* b_ws_kda_  = nullptr;
+    float* b_ws_mla_  = nullptr;
+    float* b_ws_mlp_  = nullptr;
+
     float* kda_state_ = nullptr;  // [n_kda][64*128*128]
     float* kda_conv_  = nullptr;  // [n_kda][3*8192*3]
     float* mla_cache_ = nullptr;  // [n_full][max_ctx*512]

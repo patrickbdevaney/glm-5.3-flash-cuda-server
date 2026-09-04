@@ -15,6 +15,7 @@
 #include "engine.h"
 #include "gemv.h"
 #include "weight_store.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -156,7 +157,24 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     ws_moe_  = dalloc(owned_, moe_workspace_floats());
     ws_mlp_  = dalloc(owned_, dense_mlp_workspace_floats());
     selw_    = dalloc(owned_, N_EXPERT_PER_TOK);
-    logits_dev_ = dalloc(owned_, VOCAB, &resident_);
+    // Batch activations. At max_batch 16 these total well under 200 MB, which is nothing against
+    // the weights — and they are what let one forward serve 16 tokens.
+    {
+        const int B = cfg_.max_batch < 1 ? 1 : cfg_.max_batch;
+        b_streams_ = dalloc(owned_, (size_t)B * HC_MULT * HIDDEN);
+        b_resid_   = dalloc(owned_, (size_t)B * HC_MULT * HIDDEN);
+        b_coll_    = dalloc(owned_, (size_t)B * HIDDEN);
+        b_normed_  = dalloc(owned_, (size_t)B * HIDDEN);
+        b_sub_     = dalloc(owned_, (size_t)B * HIDDEN);
+        b_pooled_  = dalloc(owned_, (size_t)B * HIDDEN);
+        b_post_    = dalloc(owned_, (size_t)B * HC_MULT);
+        b_comb_    = dalloc(owned_, (size_t)B * HC_MULT * HC_MULT);
+        b_hcws_    = dalloc(owned_, (size_t)B * hc_workspace_floats());
+        b_ws_kda_  = dalloc(owned_, kda_batch_workspace_floats(B));
+        b_ws_mla_  = dalloc(owned_, mla_batch_workspace_floats(cfg_.max_ctx, B));
+        b_ws_mlp_  = dalloc(owned_, dense_mlp_batch_workspace_floats(B));
+    }
+    logits_dev_ = dalloc(owned_, (size_t)(cfg_.max_batch < 1 ? 1 : cfg_.max_batch) * VOCAB, &resident_);
     CU(cudaHostAlloc(&logits_host_, (size_t)VOCAB * 4, cudaHostAllocDefault));
     { void* p; CU(cudaMalloc(&p, N_EXPERT_PER_TOK * 4)); owned_.push_back(p); sel_ = (int32_t*)p; }
 
@@ -193,6 +211,91 @@ __global__ void k_embed_broadcast(float* __restrict__ streams, const __nv_bfloat
     if (d >= HIDDEN) return;
     const float v = __bfloat162float(emb[(size_t)token * HIDDEN + d]);
     for (int h = 0; h < HC_MULT; ++h) streams[(size_t)h * HIDDEN + d] = v;
+}
+
+// M tokens, one forward. See engine.h for why this exists.
+void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bool all_logits,
+                           cudaStream_t s) {
+    if (M < 1 || M > cfg_.max_batch) {
+        fprintf(stderr, "engine: batch %d outside 1..%d\n", M, cfg_.max_batch); abort(); }
+    if (pos0 + M > cfg_.max_ctx) {
+        fprintf(stderr, "engine: pos %d+%d >= max_ctx %d\n", pos0, M, cfg_.max_ctx); abort(); }
+    for (int m = 0; m < M; ++m)
+        if (tokens[m] < 0 || tokens[m] >= VOCAB) {
+            fprintf(stderr, "engine: token %d out of range\n", tokens[m]); abort(); }
+
+    for (int m = 0; m < M; ++m)
+        k_embed_broadcast<<<(HIDDEN + 255) / 256, 256, 0, s>>>(
+            b_streams_ + (size_t)m * HC_MULT * HIDDEN, (const __nv_bfloat16*)embed_, tokens[m]);
+
+    for (int i = 0; i < cfg_.n_layer; ++i) {
+        LayerW& l = L_[i];
+
+        // ---- attention site ----
+        CU(cudaMemcpyAsync(b_resid_, b_streams_, (size_t)M * HC_MULT * HIDDEN * 4,
+                           cudaMemcpyDeviceToDevice, s));
+        // hc runs per token: it is 0.4% of B_tok and its own Sinkhorn is per-token state, so
+        // looping costs M x 786 KB per site (~2% of a 4-wide forward). Batching k_hc_mix would
+        // remove that; it is not the largest term and has not been done yet.
+        for (int m = 0; m < M; ++m) {
+            hc_compose(b_streams_ + (size_t)m * HC_MULT * HIDDEN, l.hc_attn,
+                       b_coll_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
+                       b_comb_ + (size_t)m * HC_MULT * HC_MULT,
+                       b_hcws_ + (size_t)m * hc_workspace_floats(), s);
+            rmsnorm(b_normed_ + (size_t)m * HIDDEN, b_coll_ + (size_t)m * HIDDEN,
+                    l.ln_in, GEMV_BF16, HIDDEN, s);
+        }
+        if (l.kda)
+            kda_batch_step(b_normed_, l.kw,
+                           kda_conv_ + (size_t)l.kda_slot * KDA_CONV_PER_LAYER,
+                           kda_state_ + (size_t)l.kda_slot * KDA_STATE_PER_LAYER,
+                           b_sub_, b_ws_kda_, M, s);
+        else
+            mla_batch_step(b_normed_, l.mw,
+                           mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
+                           pos0, M, cfg_.max_ctx, b_sub_, b_ws_mla_, s);
+        for (int m = 0; m < M; ++m)
+            hc_apply(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_resid_ + (size_t)m * HC_MULT * HIDDEN,
+                     b_sub_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
+                     b_comb_ + (size_t)m * HC_MULT * HC_MULT, s);
+
+        // ---- MLP site ----
+        CU(cudaMemcpyAsync(b_resid_, b_streams_, (size_t)M * HC_MULT * HIDDEN * 4,
+                           cudaMemcpyDeviceToDevice, s));
+        for (int m = 0; m < M; ++m) {
+            hc_compose(b_streams_ + (size_t)m * HC_MULT * HIDDEN, l.hc_ffn,
+                       b_coll_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
+                       b_comb_ + (size_t)m * HC_MULT * HC_MULT,
+                       b_hcws_ + (size_t)m * hc_workspace_floats(), s);
+            rmsnorm(b_normed_ + (size_t)m * HIDDEN, b_coll_ + (size_t)m * HIDDEN,
+                    l.ln_post, GEMV_BF16, HIDDEN, s);
+        }
+        if (l.moe) {
+            // THE ROUTED EXPERTS ARE NOT BATCHED, and that is a measured choice, not an omission.
+            // At the widths speculation uses, K tokens select almost disjoint expert sets — 29.4
+            // distinct of a possible 32 at K=4 — so batching them would save 4.7% (ROOFLINE §4).
+            // It is worth doing for wide PREFILL chunks, where the 144 experts saturate and the
+            // saving reaches 1.9x at K=32. Until then this reuses the already-gated batch-1 path.
+            for (int m = 0; m < M; ++m)
+                moe_forward(b_normed_ + (size_t)m * HIDDEN, l.ml, b_sub_ + (size_t)m * HIDDEN,
+                            sel_, selw_, ws_moe_, s);
+        } else {
+            dense_mlp_batch(b_normed_, l.dense, b_sub_, b_ws_mlp_, M, s);
+        }
+        for (int m = 0; m < M; ++m)
+            hc_apply(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_resid_ + (size_t)m * HC_MULT * HIDDEN,
+                     b_sub_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
+                     b_comb_ + (size_t)m * HC_MULT * HC_MULT, s);
+    }
+
+    if (!logits) return;
+    const int first = all_logits ? 0 : M - 1;
+    for (int m = first; m < M; ++m) {
+        hc_head_mean(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_pooled_ + (size_t)m * HIDDEN, s);
+        rmsnorm(b_pooled_ + (size_t)m * HIDDEN, b_pooled_ + (size_t)m * HIDDEN,
+                final_norm_, GEMV_BF16, HIDDEN, s);
+    }
+    gemm(logits, lm_head_, b_pooled_ + (size_t)first * HIDDEN, M - first, VOCAB, HIDDEN, GEMV_BF16, s);
 }
 
 void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
@@ -236,25 +339,28 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
 
 // ---- prefill -----------------------------------------------------------------------------------
 //
-// PREFILL IS SEQUENTIAL, AND THAT IS THE SERVER'S BIGGEST REMAINING COST. Every prompt token costs
-// a full 19.76 GB weight read, so a 1000-token prompt is ~80 s at the AR wall — a batched forward
-// would read those weights ONCE for the whole prompt. The reason it is not batched yet is KDA: 34
-// of 45 layers are a recurrence, so a batched prefill needs the chunked parallel scan, not just
-// wider GEMMs. That same multi-token forward is what speculative verification needs, so it is one
-// piece of work serving both. Recorded in OPTIMIZATION_LOG, not hidden behind a fast-looking API.
+// Chunked through forward_batch, which is the whole reason that kernel exists. A sequential
+// prefill pays the full 19.76 GB weight read for EVERY prompt token; a chunk of C amortises the
+// 15.005 GB non-expert half across all C of them, so cost per token falls from 19.76 GB to
+// 15.005/C + 4.756 GB — 8.5 GB at C=4, 5.2 GB at C=32 (ROOFLINE.md §4). That is 2.3x to 3.8x on
+// the single largest cost a request pays before its first token.
 //
-// What IS free and taken here: lm_head runs only for the LAST prompt token. It is 6.4% of B_tok,
-// so skipping it on the other N-1 is a 6.4% cut to prefill for one `nullptr`.
+// lm_head runs only for the LAST prompt token, and only on the last chunk: it is 6.4% of B_tok,
+// saved on everything else for one `nullptr`.
 int Engine::prefill(const std::vector<int>& ids, float* logits_out) {
     if (ids.empty()) throw std::runtime_error("prefill: empty prompt");
     const int start = (int)seq_.size();
     if (start + (int)ids.size() > cfg_.max_ctx)
         throw std::runtime_error("prefill: context " + std::to_string(start + ids.size()) +
                                  " exceeds max_ctx " + std::to_string(cfg_.max_ctx));
-    for (size_t i = 0; i < ids.size(); ++i) {
-        const bool last = (i + 1 == ids.size());
-        decode(ids[i], start + (int)i, last ? logits_dev_ : nullptr, 0);
-        seq_.push_back(ids[i]);
+    const int N = (int)ids.size();
+    const int C = cfg_.max_batch < 1 ? 1 : cfg_.max_batch;
+    for (int off = 0; off < N; off += C) {
+        const int m = std::min(C, N - off);
+        const bool last = (off + m == N);
+        forward_batch(ids.data() + off, m, start + off, last ? logits_dev_ : nullptr,
+                      /*all_logits=*/false, 0);
+        for (int i = 0; i < m; ++i) seq_.push_back(ids[off + i]);
     }
     CU(cudaMemcpy(logits_host_, logits_dev_, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
     if (logits_out) memcpy(logits_out, logits_host_, (size_t)VOCAB * 4);

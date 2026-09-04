@@ -209,3 +209,70 @@ trick prevents a pattern from matching *itself*, but it does nothing when the sa
 also contains the literal string elsewhere — here the path `tools/dense_nvfp4_probe.py`. The rule
 is narrower than "use brackets": **do not pkill a pattern that appears anywhere in your own
 command line.** Kill by PID, or run the pkill from a command that does not name the target.
+
+---
+
+## #6 — The server, and one bug only a live run could find
+
+The tokenizer, chat encoder, sampler, stream splitter and OpenAI shaping are all gated on the CPU:
+**256 checks, no GPU, no weights** beyond the checkpoint's own `tokenizer.json`. 170 of them are
+id-exact against HF over adversarial strings, 42 are byte-exact against HF's own Jinja over 19
+prompt fixtures. Those two are exact-match, not similarity, because a tokenizer or template that is
+99% right is worse than one that is obviously broken: the model keeps producing fluent text from
+subtly wrong ids and nothing in the stack reports an error.
+
+Three things that would have been wrong if ported from `0731` by habit:
+
+- **The pre-tokenizer is one stage here, not four.** GLM uses the standard GPT-4 alternation;
+  DeepSeek-V4 splits digits and CJK first. And **`ignore_merges` is set**, which DeepSeek's is not:
+  a pre-token that is already a vocab entry is emitted whole and BPE never runs on it.
+- **Only 18 of the 36 added tokens are `special`.** `</think>`, `<tool_call>` and the `<arg_key>` /
+  `<arg_value>` markers are added-but-not-special, so `skip_special_tokens` must not drop them —
+  they are exactly what the stream splitter and tool parser exist to find.
+- **`reasoning_effort` accepts only `low` and `high`.** Everything else, *including omitting it*,
+  renders as `Max`. The default is the most expensive setting, and `medium` is silently `Max`.
+
+Then the 3-layer smoke run found the bug the gates could not. With `--n-layer 3` the text is
+meaningless but the plumbing is real, and the two response paths disagreed: the streaming splitter
+knows generation starts inside a `<think>` block, but the non-streaming parser looked for a
+`</think>` and, not finding one in a truncated generation, called the whole thing `content`. Same
+tokens, same request, different answer depending on whether the client asked for a stream. Fixed by
+telling the parser where it starts; gated both ways.
+
+**Worth keeping:** a smoke test on a deliberately undersized load is not a lesser test. It cost
+10 GiB and four minutes and caught a real divergence that 256 unit checks did not, because the bug
+lived in the seam between two components that were each individually correct.
+
+---
+
+## #7 — The multi-token forward, bit-exact, and what it costs to verify a draft
+
+`forward_batch` runs M tokens in one pass, reading each weight ONCE instead of M times. It is
+gated **bit-exact** against M sequential `decode()` calls — equality of floats, not closeness — at
+widths 1,2,3,4,5,8, at ragged widths, and interleaved with single-token decodes. That standard is
+not fussiness: a speculative verify that merely approximates the AR path silently stops sampling
+from the AR distribution, which no benchmark can falsify. It is achievable because the batched gemm
+reduces in the same order as the gemv, and every non-gemm kernel is called per token with offset
+pointers.
+
+The gate runs at 4 layers, which reaches layer 3 — **the first MLA and MoE layer — so both are now
+exercised inside the engine loop**, not only standalone. And it needs no PyTorch oracle at all: its
+reference is the engine's own already-gated sequential path. That makes it the one whole-engine
+gate that runs while the box is busy, which is most of the time.
+
+Two decisions recorded with their arithmetic rather than their intuition:
+
+- **The routed experts are deliberately NOT batched.** At the widths speculation uses, K tokens
+  select almost disjoint expert sets — 29.4 distinct of a possible 32 at K=4 — so batching them
+  would save **4.7%**. It reaches 1.9x at K=32, so it is worth doing for wide prefill chunks and
+  not for verify. Until then the already-gated batch-1 path is reused.
+- **Prefill now chunks through it**, which was the server's single largest cost: sequential prefill
+  pays the full 19.76 GB weight read for every prompt token, where a chunk of C amortises 15.005 GB
+  of it. 2.3x at C=4, 3.8x at C=32.
+
+And the correction that matters most, in SPEC_DECODE.md: **the draft head's own `lm_head` is
+1.269 G per drafted token**, which is larger than the entire rest of the MTP block. Folding it in
+drops the predicted speculation win from 1.59x to 1.38x. It should be NVFP4, and doing so is
+system-level lossless — a draft error costs a rejection, not a wrong output — which brings it to
+1.49x. The largest single draft cost sits in the one place where reduced precision cannot hurt
+quality.

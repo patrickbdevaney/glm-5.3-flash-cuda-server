@@ -17,13 +17,14 @@ for g in gate_kda gate_moe gate_layer gate_mla; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $K -o build/$g && echo "built build/$g"
 done
 # gates that drive the whole engine
-for g in gate_stack; do
+for g in gate_stack gate_batch; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $E -o build/$g && echo "built build/$g"
 done
 for t in bench_kda; do
   nvcc -O2 -std=c++17 $ARCH -I include tools/$t.cu $K -o build/$t && echo "built build/$t"
 done
 nvcc -O2 -std=c++17 $ARCH -I include tools/bw_probe.cu -o build/bw_probe && echo "built build/bw_probe"
+nvcc -O2 -std=c++17 $ARCH -I include tools/bench_batch.cu $E -o build/bench_batch && echo "built build/bench_batch"
 
 # The server. -pthread for httplib's thread pool; the UI, API shaping and tokenizer are all headers.
 nvcc -O2 -std=c++17 $ARCH -I include -Xcompiler -pthread \

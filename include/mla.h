@@ -17,6 +17,7 @@ struct MlaWeights {
 };
 
 size_t mla_workspace_floats(int max_ctx);
+size_t mla_batch_workspace_floats(int max_ctx, int M);
 
 // One decode step. `cache` is the 512-wide MLA latent cache [max_ctx, 512] fp32; the new token's
 // latent is appended at row `t` (0-based), and attention runs over rows 0..t inclusive.
@@ -27,5 +28,18 @@ size_t mla_workspace_floats(int max_ctx);
 // ref/gen_mla.py verifies this against the real indexer rather than asserting it.
 void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, int max_ctx,
                      float* y, float* ws, cudaStream_t s);
+
+// M tokens through one MLA layer in one pass. Positions are pos0 .. pos0+M-1.
+//
+// The projections are batched (2.584 G/token, 13.1% of B_tok, read once for all M). The attention
+// itself loops per token, because it is cheap in weights and expensive only in CACHE, and the cache
+// re-read is ~1% of a 4-wide forward.
+//
+// CAUSALITY WITHIN THE BATCH is why all M latents are stored before any attention runs: token m
+// must see tokens pos0..pos0+m, including its own batch-mates that precede it. Attending first and
+// storing after would hide them and silently produce a non-causal — and wrong — result that still
+// looks like fluent text.
+void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0, int M,
+                    int max_ctx, float* y, float* ws, cudaStream_t s);
 
 }  // namespace glm5

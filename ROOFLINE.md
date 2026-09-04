@@ -129,3 +129,65 @@ dense weights that are **completely shared** across a verify batch.
 So the verify batch must be built so that batch cost is flat in K. That is a design constraint
 on the kernels from day one, not an optimisation to retrofit — and it is the thing to measure
 first, before any draft-head fine-tune.
+
+---
+
+## §4 — the batch-cost curve, and what it says about speculation
+
+Speculation lost on the GGUF build for a reason that had nothing to do with the draft head: llama.cpp's
+batch cost is flat below 32 tokens (`llamacpp-small-batch-offload-cliff`), so a depth-K draft always
+landed on the wrong side of the cliff and a 72%-accurate head still made things slower. Here the
+kernels are ours, so the curve is ours to set — and it is worth writing down what it *has* to look
+like before building anything against it.
+
+A K-wide forward reads the non-expert weights **once**, and reads whichever routed experts the K
+tokens between them select. So the cost splits cleanly:
+
+| | per forward |
+|---|---|
+| everything except routed experts | **15.005 G**, independent of K |
+| each distinct routed expert touched | 0.5945 G |
+
+With independent routing (8 of 144 per token), `E[distinct] = 144·(1 − (1 − 8/144)^K)`:
+
+| K | E[distinct experts] | cost | vs one AR step | ceiling if all K accept |
+|---|---|---|---|---|
+| 1 | 8.0 | 19.76 G | 1.000 | 1.00x |
+| 2 | 15.6 | 24.25 G | 1.227 | 1.63x |
+| 3 | 22.7 | 28.50 G | 1.442 | 2.08x |
+| 4 | 29.4 | 32.50 G | 1.645 | 2.43x |
+| 6 | 41.8 | 39.86 G | 2.017 | 2.97x |
+| 8 | 52.8 | 46.42 G | 2.349 | 3.41x |
+
+Folding in the acceptance already measured on this checkpoint — 72.26% at depth 1, un-fine-tuned
+(`glm53-nvfp4-mtp-gate2`) — gives the predicted end-to-end speedup:
+
+| draft depth | verify width | tokens/iteration | cost | **speedup** |
+|---|---|---|---|---|
+| 1 | 2 | 1.72 | 1.227 | 1.40x |
+| 2 | 3 | 2.24 | 1.442 | 1.55x |
+| **3** | **4** | **2.62** | **1.645** | **1.59x** |
+| 4 | 5 | 2.89 | 1.836 | 1.57x |
+
+**Depth 3 is the optimum and it is a flat one** — depths 2 to 4 are all within 3% of each other, so
+the exact choice does not much matter and tuning it is not worth a session.
+
+Three things this table is honest about:
+
+1. **It excludes the draft head's own cost.** The MTP block at layer 45 has to run once per drafted
+   token. That has since been costed in SPEC_DECODE.md and it is not small: one MLA+MoE layer
+   (0.371 G) plus `eh_proj` (0.067 G) plus **`lm_head` at 1.269 G**, which dominates. Folding it in
+   pulls the 1.59x at depth 3 down to **1.38x**, and moves the optimum to depth 2. Quantising the
+   draft `lm_head` to NVFP4 — system-level lossless, because a draft error costs a rejection and
+   not an output error — brings it back to **1.49x**.
+2. **Independent routing is the PESSIMISTIC assumption.** Adjacent tokens in a real sequence have
+   correlated hidden states, so they share more experts than chance, `E[distinct]` is lower, and the
+   true curve is cheaper than this one. Measuring the actual overlap needs the full 45-layer load.
+3. **It assumes the batched GEMM holds the same bandwidth as the gemv.** At K ≤ 8 the operation is
+   still firmly memory-bound, so it should; that is a measurement, not a proof.
+
+The conclusion that matters for the build order: **a multi-token forward is the prerequisite, not
+the speculation logic.** Verifying K drafted tokens one at a time costs exactly K AR steps and wins
+nothing no matter how good the head is. The same kernel also fixes prefill, which is today the
+server's single largest cost — sequential prefill pays the full 19.76 G for every prompt token,
+where a K-wide chunk amortises 15.005 G of it across K.
