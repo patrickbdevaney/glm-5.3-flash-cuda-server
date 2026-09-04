@@ -343,7 +343,14 @@ inline std::string encode_messages(const json& messages, const json& tools, cons
 // ---- the inverse: completion text -> an OpenAI message -------------------------------------------
 // The engine is prompted with a trailing `<think>`, so the model's output STARTS inside the
 // reasoning block and the opening tag is never generated.
-inline json parse_message_from_completion_text(const std::string& text_in) {
+//
+// `starts_in_reasoning` is not a detail. When generation is cut off by max_tokens before the model
+// ever closes the block, there is no `</think>` to find — and treating that as content puts raw
+// scratchpad in the `content` field. The STREAMING path has this right for free (its splitter is
+// told where it starts), so getting it wrong here makes the two paths disagree about the same
+// generation: caught by exactly that comparison in the 3-layer smoke test.
+inline json parse_message_from_completion_text(const std::string& text_in,
+                                               bool starts_in_reasoning = true) {
     std::string text = text_in;
     json msg = json::object();
     msg["role"] = "assistant";
@@ -356,6 +363,9 @@ inline json parse_message_from_completion_text(const std::string& text_in) {
         const size_t ts = reasoning.rfind(THINK_START);
         if (ts != std::string::npos) reasoning = reasoning.substr(ts + std::string(THINK_START).size());
         text = text.substr(te + std::string(THINK_END).size());
+    } else if (starts_in_reasoning) {
+        reasoning = text;                     // the whole generation is an unterminated think block
+        text.clear();
     }
 
     json tool_calls = json::array();

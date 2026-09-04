@@ -83,6 +83,22 @@ int main(int argc, char** argv) {
         if (ok) { ++pass; printf("  ok   parse_completion\n"); }
         else { ++fail; printf("  FAIL parse_completion: %s\n", m.dump().c_str()); }
     }
+    // Truncated before `</think>`: everything is reasoning, content is empty. The streaming
+    // splitter already behaves this way, so a parser that disagreed would make the same generation
+    // come back differently depending on whether the client asked for a stream.
+    {
+        const json m = glm5enc::parse_message_from_completion_text("still thinking when the budget ran out");
+        const bool ok = m["content"] == "" && m["reasoning_content"] == "still thinking when the budget ran out";
+        if (ok) { ++pass; printf("  ok   parse_unterminated_think\n"); }
+        else { ++fail; printf("  FAIL parse_unterminated_think: %s\n", m.dump().c_str()); }
+    }
+    // ...but a raw /v1/completions turn does not start in a think block.
+    {
+        const json m = glm5enc::parse_message_from_completion_text("plain text", false);
+        const bool ok = m["content"] == "plain text" && !m.contains("reasoning_content");
+        if (ok) { ++pass; printf("  ok   parse_not_in_reasoning\n"); }
+        else { ++fail; printf("  FAIL parse_not_in_reasoning: %s\n", m.dump().c_str()); }
+    }
     // A call truncated by the token budget must still parse, not throw or hang.
     {
         const json m = glm5enc::parse_message_from_completion_text(

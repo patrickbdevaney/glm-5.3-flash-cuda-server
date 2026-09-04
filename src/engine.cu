@@ -15,8 +15,10 @@
 #include "engine.h"
 #include "gemv.h"
 #include "weight_store.h"
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace glm5 {
@@ -154,6 +156,8 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     ws_moe_  = dalloc(owned_, moe_workspace_floats());
     ws_mlp_  = dalloc(owned_, dense_mlp_workspace_floats());
     selw_    = dalloc(owned_, N_EXPERT_PER_TOK);
+    logits_dev_ = dalloc(owned_, VOCAB, &resident_);
+    CU(cudaHostAlloc(&logits_host_, (size_t)VOCAB * 4, cudaHostAllocDefault));
     { void* p; CU(cudaMalloc(&p, N_EXPERT_PER_TOK * 4)); owned_.push_back(p); sel_ = (int32_t*)p; }
 
     kda_state_ = dalloc(owned_, (size_t)n_kda_ * KDA_STATE_PER_LAYER, &resident_);
@@ -167,6 +171,7 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
 }
 
 Engine::~Engine() {
+    if (logits_host_) cudaFreeHost(logits_host_);
     for (void* p : owned_) cudaFree(p);
     delete ws_;
 }
@@ -177,6 +182,7 @@ void Engine::reset(cudaStream_t s) {
     CU(cudaMemsetAsync(kda_state_, 0, (size_t)n_kda_ * KDA_STATE_PER_LAYER * 4, s));
     CU(cudaMemsetAsync(kda_conv_, 0, (size_t)n_kda_ * KDA_CONV_PER_LAYER * 4, s));
     CU(cudaMemsetAsync(mla_cache_, 0, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA * 4, s));
+    seq_.clear();
 }
 
 // streams[h][d] = embed[token][d] for every h — the model broadcasts one embedding across all
@@ -226,6 +232,87 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
     hc_head_mean(streams_, pooled_, s);                     // unweighted mean over the 4 streams
     rmsnorm(pooled_, pooled_, final_norm_, GEMV_BF16, HIDDEN, s);
     gemv(logits, lm_head_, pooled_, VOCAB, HIDDEN, GEMV_BF16, s);
+}
+
+// ---- prefill -----------------------------------------------------------------------------------
+//
+// PREFILL IS SEQUENTIAL, AND THAT IS THE SERVER'S BIGGEST REMAINING COST. Every prompt token costs
+// a full 19.76 GB weight read, so a 1000-token prompt is ~80 s at the AR wall — a batched forward
+// would read those weights ONCE for the whole prompt. The reason it is not batched yet is KDA: 34
+// of 45 layers are a recurrence, so a batched prefill needs the chunked parallel scan, not just
+// wider GEMMs. That same multi-token forward is what speculative verification needs, so it is one
+// piece of work serving both. Recorded in OPTIMIZATION_LOG, not hidden behind a fast-looking API.
+//
+// What IS free and taken here: lm_head runs only for the LAST prompt token. It is 6.4% of B_tok,
+// so skipping it on the other N-1 is a 6.4% cut to prefill for one `nullptr`.
+int Engine::prefill(const std::vector<int>& ids, float* logits_out) {
+    if (ids.empty()) throw std::runtime_error("prefill: empty prompt");
+    const int start = (int)seq_.size();
+    if (start + (int)ids.size() > cfg_.max_ctx)
+        throw std::runtime_error("prefill: context " + std::to_string(start + ids.size()) +
+                                 " exceeds max_ctx " + std::to_string(cfg_.max_ctx));
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const bool last = (i + 1 == ids.size());
+        decode(ids[i], start + (int)i, last ? logits_dev_ : nullptr, 0);
+        seq_.push_back(ids[i]);
+    }
+    CU(cudaMemcpy(logits_host_, logits_dev_, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
+    if (logits_out) memcpy(logits_out, logits_host_, (size_t)VOCAB * 4);
+    return argmax(logits_host_, VOCAB);
+}
+
+// ---- generate ----------------------------------------------------------------------------------
+GenStats Engine::generate(const std::vector<int>& ids, const GenParams& p,
+                          const std::function<bool(int)>& on_token) {
+    using clock = std::chrono::steady_clock;
+    GenStats st;
+    st.prompt_tokens = (int)ids.size();
+    if (ids.empty()) throw std::runtime_error("generate: empty prompt");
+
+    // PREFIX REUSE. The state is a RECURRENCE, so it cannot be rewound: a prefix is reusable only
+    // when the new request begins with EVERYTHING the state has already consumed, prompt and
+    // previous generation alike. That is the ordinary multi-turn shape, and it turns the second
+    // turn of a conversation from a full re-prefill into just the new tokens. Any divergence —
+    // including a client that drops reasoning_content from the history, which changes the rendered
+    // prompt — falls back to a full reset. Strictly a prefix, never a partial match.
+    size_t reuse = 0;
+    if (!seq_.empty() && ids.size() > seq_.size() &&
+        std::equal(seq_.begin(), seq_.end(), ids.begin()))
+        reuse = seq_.size();
+    else
+        reset(0);
+    st.cached_tokens = (int)reuse;
+
+    const auto t0 = clock::now();
+    std::vector<int> tail(ids.begin() + reuse, ids.end());
+    prefill(tail);
+    CU(cudaDeviceSynchronize());
+    const auto t1 = clock::now();
+    st.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    uint64_t rng = p.has_seed ? p.seed
+                              : (uint64_t)clock::now().time_since_epoch().count();
+    auto is_eos = [&](int t) {
+        for (int e : p.eos_ids) if (t == e) return true;
+        return false;
+    };
+
+    int next = sample(logits_host_, VOCAB, p.sampling, rng, scratch_);
+    for (int n = 0; n < p.max_tokens; ++n) {
+        if (is_eos(next)) { st.hit_eos = true; break; }     // EOS never reaches the callback
+        ++st.completion_tokens;
+        if (on_token && !on_token(next)) break;
+        if ((int)seq_.size() >= cfg_.max_ctx) break;
+        if (n + 1 >= p.max_tokens) break;                   // no need to run a forward we discard
+        decode(next, (int)seq_.size(), logits_dev_, 0);
+        seq_.push_back(next);
+        CU(cudaMemcpy(logits_host_, logits_dev_, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
+        next = sample(logits_host_, VOCAB, p.sampling, rng, scratch_);
+    }
+    CU(cudaDeviceSynchronize());
+    st.decode_ms = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
+    st.tok_per_s = st.decode_ms > 0 ? st.completion_tokens * 1000.0 / st.decode_ms : 0.0;
+    return st;
 }
 
 }  // namespace glm5

@@ -2,9 +2,11 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 #include "glm5_config.h"
+#include "sample.h"
 #include "kda.h"
 #include "mla.h"
 #include "layer.h"
@@ -21,10 +23,38 @@ struct EngineConfig {
     bool verbose    = true;
 };
 
+// What a caller asks for. Defaults are generation_config.json's, not the habitual 0.7/0.9 —
+// this checkpoint ships temperature 1.0 / top_p 0.95 and those are the numbers it was tuned at.
+struct GenParams {
+    SampleParams sampling;                  // temperature 1.0, top_p 0.95
+    int  max_tokens = 512;
+    bool has_seed   = false;                // without one, the seed comes from the clock
+    uint64_t seed   = 0;
+    std::vector<int> eos_ids;               // three of them for this model; empty = never stop early
+};
+
+struct GenStats {
+    int prompt_tokens = 0;
+    int cached_tokens = 0;                  // prompt tokens served from the resident prefix
+    int completion_tokens = 0;
+    double prefill_ms = 0, decode_ms = 0, tok_per_s = 0;
+    bool hit_eos = false;
+};
+
 class Engine {
 public:
     explicit Engine(const EngineConfig& cfg);
     ~Engine();
+
+    // Prefill `ids`, then decode until EOS or max_tokens. `on_token` receives each generated id and
+    // returns false to stop. EOS is NOT delivered to the callback — a server would have to filter
+    // it out of every stream otherwise, and forgetting to is how a stop token ends up in the text.
+    GenStats generate(const std::vector<int>& ids, const GenParams& p,
+                      const std::function<bool(int)>& on_token);
+
+    // Prefill only, leaving the sequence state at the end of `ids`. Returns the logits for the
+    // last token in `logits_out` (host, VOCAB floats) if non-null.
+    int prefill(const std::vector<int>& ids, float* logits_out = nullptr);
 
     // One decode step at position `pos` (0-based). Writes logits [VOCAB] fp32 to `logits`.
     // Advances the KDA recurrent state and the MLA latent cache in place.
@@ -41,6 +71,7 @@ public:
     double residentGiB() const;
     int    maxCtx() const { return cfg_.max_ctx; }
     int    nLayer()  const { return cfg_.n_layer; }
+    int    seqLen()  const { return (int)seq_.size(); }     // tokens currently in the resident state
 
 private:
     struct LayerW {
@@ -85,6 +116,17 @@ private:
     float* kda_conv_  = nullptr;  // [n_kda][3*8192*3]
     float* mla_cache_ = nullptr;  // [n_full][max_ctx*512]
     int n_kda_ = 0, n_full_ = 0;
+
+    // Host-side logits staging. Pinned, because at 620 KB per token an unpinned copy is a staged
+    // pageable transfer that serialises against the next step's kernels.
+    float* logits_host_ = nullptr;
+    float* logits_dev_  = nullptr;
+
+    // Everything the resident state has already consumed, prompt and generated alike. A request
+    // whose ids begin with exactly this can skip straight to the tail — see generate().
+    std::vector<int> seq_;
+
+    std::vector<std::pair<float,int>> scratch_;             // sampler workspace, reused
 
     std::vector<void*> owned_;
     double resident_ = 0;
