@@ -1,0 +1,11 @@
+layer=0
+hidden=4096
+heads=64
+head_dim=128
+qkv_dim=8192
+conv_k=4
+gate_rank=128
+lower_bound=-5.0
+rms_eps=1e-05
+prefill=17
+seed=1234
