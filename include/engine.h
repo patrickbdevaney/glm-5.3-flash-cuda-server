@@ -23,6 +23,11 @@ struct EngineConfig {
     // Widest multi-token forward the engine will run: the prefill chunk, and the ceiling on
     // speculative verify width. Sizes the batch activation buffers, so it must be set before load.
     int  max_batch  = 16;
+    // Recurrent-state slots. 1 = ordinary autoregression, updated in place, no extra memory.
+    // Speculation needs draft_width+1: token m of a verify writes slot m+1, so slot j holds the
+    // state after exactly j tokens and rejecting K-j drafts is a pointer move rather than an
+    // impossible rewind (SPEC_DECODE.md). Each slot is 145.56 MiB at the full 45 layers.
+    int  state_slots = 1;
     bool verbose    = true;
 };
 
@@ -72,8 +77,14 @@ public:
     //
     // `logits` is [M, VOCAB] when all_logits, else [VOCAB] for the last token only; nullptr skips
     // lm_head entirely (6.4% of B_tok saved on every prefill chunk but the last).
+    // `snapshot` requires state_slots > M: the recurrent state is then left one-per-position
+    // instead of one-at-the-end, at no extra bandwidth. Follow it with commit_state_slot(j).
     void forward_batch(const int* tokens, int M, int pos0, float* logits, bool all_logits,
-                       cudaStream_t s = 0);
+                       cudaStream_t s = 0, bool snapshot = false);
+
+    // Make slot j the canonical state. This is how a speculative verify accepts j of K drafts.
+    void commit_state_slot(int j, cudaStream_t s = 0);
+    int  stateSlots() const { return cfg_.state_slots; }
 
     // One decode step at position `pos` (0-based). Writes logits [VOCAB] fp32 to `logits`.
     // Advances the KDA recurrent state and the MLA latent cache in place.

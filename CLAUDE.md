@@ -58,3 +58,33 @@ independently measured at 89% of spec reports ~30%. Bandwidth utilisation stays 
 
 98 GiB checkpoint, 129 GiB free at repo creation. Do not materialise a second full-precision copy
 of the model. Requantisation work writes tensor-at-a-time and streams.
+
+## §6 — measuring on a shared box
+
+Two runs in this repo have now produced a number that looked like a finding and was contention:
+
+- `bench_kda` reported "29.3% of achievable" against the idle-box 240 GB/s while an unattended job
+  held the GPU at 96%. A streaming probe at that instant managed 82.8 GB/s: the kernel was at the
+  ceiling (`OPTIMIZATION_LOG` #1).
+- `bench_batch`, timing each width in one contiguous block, reported **K=2 as faster than K=1 in
+  absolute ms/forward** — arithmetically impossible, and only visible because that comparison has a
+  known sign.
+
+So, for any timing on this box:
+
+1. **Measure a streaming read in the same process, immediately before the timing loop**, and report
+   everything against that number rather than against 240 GB/s.
+2. **Visit the conditions round-robin, not in blocks**, so a contention spike lands on all of them.
+3. **Report the minimum over reps, with the median beside it.** The true cost is a floor set by
+   bandwidth; every disturbance can only push a sample above it. If min and median diverge, the run
+   is not a measurement — say so and repeat it, rather than reading a trend into the noise.
+4. **Include a comparison whose sign you already know.** The K=2 < K=1 result was caught only
+   because monotonicity was predictable. A benchmark with no such anchor cannot tell you it is lying.
+
+## §7 — do not pgrep or pkill a pattern that appears in your own command line
+
+`pkill -f "[d]ense_nvfp4_probe"` killed its own shell. The bracket trick stops a pattern matching
+*itself*, but the same command line also contained the literal path `tools/dense_nvfp4_probe.py`,
+which the pattern matched. It happened a second time with `pkill -f 'build/glm5-server'` in a
+command that also rebuilt `build/glm5-server`. Kill by PID, or put the kill in a command that names
+nothing else.

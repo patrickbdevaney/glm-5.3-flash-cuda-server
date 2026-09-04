@@ -178,8 +178,9 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     CU(cudaHostAlloc(&logits_host_, (size_t)VOCAB * 4, cudaHostAllocDefault));
     { void* p; CU(cudaMalloc(&p, N_EXPERT_PER_TOK * 4)); owned_.push_back(p); sel_ = (int32_t*)p; }
 
-    kda_state_ = dalloc(owned_, (size_t)n_kda_ * KDA_STATE_PER_LAYER, &resident_);
-    kda_conv_  = dalloc(owned_, (size_t)n_kda_ * KDA_CONV_PER_LAYER, &resident_);
+    if (cfg_.state_slots < 1) cfg_.state_slots = 1;
+    kda_state_ = dalloc(owned_, (size_t)cfg_.state_slots * n_kda_ * KDA_STATE_PER_LAYER, &resident_);
+    kda_conv_  = dalloc(owned_, (size_t)cfg_.state_slots * n_kda_ * KDA_CONV_PER_LAYER, &resident_);
     mla_cache_ = dalloc(owned_, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA, &resident_);
     if (cfg_.verbose)
         printf("engine: %d KDA layers (%.2f MiB state, context-independent), %d full-attn layers "
@@ -197,8 +198,8 @@ Engine::~Engine() {
 double Engine::residentGiB() const { return resident_; }
 
 void Engine::reset(cudaStream_t s) {
-    CU(cudaMemsetAsync(kda_state_, 0, (size_t)n_kda_ * KDA_STATE_PER_LAYER * 4, s));
-    CU(cudaMemsetAsync(kda_conv_, 0, (size_t)n_kda_ * KDA_CONV_PER_LAYER * 4, s));
+    CU(cudaMemsetAsync(kda_state_, 0, (size_t)cfg_.state_slots * n_kda_ * KDA_STATE_PER_LAYER * 4, s));
+    CU(cudaMemsetAsync(kda_conv_, 0, (size_t)cfg_.state_slots * n_kda_ * KDA_CONV_PER_LAYER * 4, s));
     CU(cudaMemsetAsync(mla_cache_, 0, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA * 4, s));
     seq_.clear();
 }
@@ -214,8 +215,23 @@ __global__ void k_embed_broadcast(float* __restrict__ streams, const __nv_bfloat
 }
 
 // M tokens, one forward. See engine.h for why this exists.
+void Engine::commit_state_slot(int j, cudaStream_t s) {
+    if (j < 0 || j >= cfg_.state_slots) {
+        fprintf(stderr, "engine: slot %d outside 0..%d\n", j, cfg_.state_slots - 1); abort(); }
+    if (j == 0) return;
+    const size_t sstride = (size_t)n_kda_ * KDA_STATE_PER_LAYER;
+    const size_t cstride = (size_t)n_kda_ * KDA_CONV_PER_LAYER;
+    CU(cudaMemcpyAsync(kda_state_, kda_state_ + (size_t)j * sstride, sstride * 4,
+                       cudaMemcpyDeviceToDevice, s));
+    CU(cudaMemcpyAsync(kda_conv_, kda_conv_ + (size_t)j * cstride, cstride * 4,
+                       cudaMemcpyDeviceToDevice, s));
+}
+
 void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bool all_logits,
-                           cudaStream_t s) {
+                           cudaStream_t s, bool snapshot) {
+    if (snapshot && cfg_.state_slots <= M) {
+        fprintf(stderr, "engine: snapshot of %d tokens needs state_slots > %d, have %d\n",
+                M, M, cfg_.state_slots); abort(); }
     if (M < 1 || M > cfg_.max_batch) {
         fprintf(stderr, "engine: batch %d outside 1..%d\n", M, cfg_.max_batch); abort(); }
     if (pos0 + M > cfg_.max_ctx) {
@@ -246,9 +262,13 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
                     l.ln_in, GEMV_BF16, HIDDEN, s);
         }
         if (l.kda)
-            kda_batch_step(b_normed_, l.kw,
+            // Slot stride is the whole per-slot state, so layer l's slot m sits at
+            // base + m*stride + l*per_layer. Stride 0 is the in-place autoregressive case.
+            kda_batch_step_slots(b_normed_, l.kw,
                            kda_conv_ + (size_t)l.kda_slot * KDA_CONV_PER_LAYER,
+                           snapshot ? (size_t)n_kda_ * KDA_CONV_PER_LAYER : 0,
                            kda_state_ + (size_t)l.kda_slot * KDA_STATE_PER_LAYER,
+                           snapshot ? (size_t)n_kda_ * KDA_STATE_PER_LAYER : 0,
                            b_sub_, b_ws_kda_, M, s);
         else
             mla_batch_step(b_normed_, l.mw,

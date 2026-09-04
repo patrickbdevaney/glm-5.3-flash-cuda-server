@@ -54,17 +54,25 @@ size_t kda_batch_workspace_floats(int M) { return (size_t)M * (13 * (size_t)Q + 
 //
 // The checkpoint splits this into q_conv1d / k_conv1d / v_conv1d, each [8192, 1, 4]; the loader
 // concatenates them in q,k,v order to match the reference's single [24576, 1, 4].
-__global__ void k_conv_silu(float* __restrict__ out, float* __restrict__ conv_state,
+// The window is read into registers before anything is written, so `st_in == st_out` (the ordinary
+// in-place autoregressive case) behaves exactly as it did. Separate pointers exist so a
+// multi-token forward can leave one window per position instead of one at the end — see
+// SPEC_DECODE.md: a rejected draft has to return to an earlier state, and a recurrence has no
+// inverse to apply.
+__global__ void k_conv_silu(float* __restrict__ out, const float* __restrict__ st_in,
+                            float* __restrict__ st_out,
                             const float* __restrict__ qkv_raw, const float* __restrict__ wgt,
                             int C) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    float* st = conv_state + (size_t)c * CS;
+    const float* si = st_in + (size_t)c * CS;
+    float* so = st_out + (size_t)c * CS;
     const float* w = wgt + (size_t)c * CK;
     const float xn = qkv_raw[c];
 
-    float acc = st[0] * w[0] + st[1] * w[1] + st[2] * w[2] + xn * w[3];
-    st[0] = st[1]; st[1] = st[2]; st[2] = xn;          // shift the window
+    const float s0 = si[0], s1 = si[1], s2 = si[2];
+    const float acc = s0 * w[0] + s1 * w[1] + s2 * w[2] + xn * w[3];
+    so[0] = s1; so[1] = s2; so[2] = xn;                 // shift the window
 
     out[c] = acc / (1.f + __expf(-acc));                // silu
 }
@@ -126,13 +134,17 @@ __global__ void k_l2norm(float* __restrict__ q_n, float* __restrict__ k_n,
 //
 // S is row-major [k][v], so for a fixed k all 128 threads read 128 consecutive floats: coalesced
 // in HBM and bank-conflict-free in shared memory. The state crosses HBM exactly once each way.
-__global__ void k_recurrence(float* __restrict__ core, float* __restrict__ S,
+__global__ void k_recurrence(float* __restrict__ core, const float* __restrict__ S_in,
+                             float* __restrict__ S_out,
                              const float* __restrict__ q_n, const float* __restrict__ k_n,
                              const float* __restrict__ v_in, const float* __restrict__ g,
                              const float* __restrict__ beta) {
     extern __shared__ float Ss[];                    // [D][D] = 64 KiB
     const int h = blockIdx.x, v = threadIdx.x;
-    float* Sh = S + (size_t)h * D * D;
+    // The decay pass reads the whole state into shared memory before the update pass writes any of
+    // it, so S_in == S_out is safe and is exactly the in-place autoregressive case.
+    const float* Shi = S_in  + (size_t)h * D * D;
+    float* Sho       = S_out + (size_t)h * D * D;
 
     __shared__ float eg[D], kk[D], qq[D];
     eg[v] = __expf(g[(size_t)h * D + v]);
@@ -146,7 +158,7 @@ __global__ void k_recurrence(float* __restrict__ core, float* __restrict__ S,
     float kv_mem = 0.f;
     #pragma unroll 8
     for (int k = 0; k < D; ++k) {
-        const float s = Sh[(size_t)k * D + v] * eg[k];
+        const float s = Shi[(size_t)k * D + v] * eg[k];
         Ss[k * D + v] = s;
         kv_mem += s * kk[k];
     }
@@ -158,7 +170,7 @@ __global__ void k_recurrence(float* __restrict__ core, float* __restrict__ S,
     #pragma unroll 8
     for (int k = 0; k < D; ++k) {
         const float s = Ss[k * D + v] + kk[k] * delta;
-        Sh[(size_t)k * D + v] = s;
+        Sho[(size_t)k * D + v] = s;
         out += s * qq[k];
     }
     core[(size_t)h * D + v] = out;
@@ -209,7 +221,8 @@ void kda_qkv_conv(const float* x, const KdaWeights& W, float* conv_state, float*
     gemv(q_raw + 2 * Q, W.v_proj, x, Q, HIDDEN, W.dtype, s);
     const int C = 3 * Q;
     // conv weights are fp32 in the gate and bf16 in production; upconvert once at load, not here.
-    k_conv_silu<<<(C + 255) / 256, 256, 0, s>>>(qkv, conv_state, q_raw, (const float*)W.conv1d, C);
+    k_conv_silu<<<(C + 255) / 256, 256, 0, s>>>(qkv, conv_state, conv_state, q_raw,
+                                                (const float*)W.conv1d, C);
 }
 
 void kda_gates(const float* x, const KdaWeights& W, float* g, float* beta, float* gate, float* ws,
@@ -230,15 +243,21 @@ void kda_norm_qk(const float* qkv, float* q_n, float* k_n, cudaStream_t s) {
     k_l2norm<<<H, D, 0, s>>>(q_n, k_n, qkv);
 }
 
-void kda_recurrence(const float* q_n, const float* k_n, const float* v_in, const float* g,
-                    const float* beta, float* S, float* core, cudaStream_t s) {
+void kda_recurrence_slots(const float* q_n, const float* k_n, const float* v_in, const float* g,
+                          const float* beta, const float* S_in, float* S_out, float* core,
+                          cudaStream_t s) {
     static bool optin = false;
     const size_t smem = (size_t)D * D * sizeof(float);      // 64 KiB
     if (!optin) {
         CU(cudaFuncSetAttribute(k_recurrence, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
         optin = true;
     }
-    k_recurrence<<<H, D, smem, s>>>(core, S, q_n, k_n, v_in, g, beta);
+    k_recurrence<<<H, D, smem, s>>>(core, S_in, S_out, q_n, k_n, v_in, g, beta);
+}
+
+void kda_recurrence(const float* q_n, const float* k_n, const float* v_in, const float* g,
+                    const float* beta, float* S, float* core, cudaStream_t s) {
+    kda_recurrence_slots(q_n, k_n, v_in, g, beta, S, S, core, s);
 }
 
 void kda_out_norm(const float* core, const float* gate, const void* w, int dtype, float* normed,
@@ -298,6 +317,18 @@ __global__ void k_forget_gate_batch(float* __restrict__ g, const float* __restri
 
 void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, float* S,
                     float* y, float* ws, int M, cudaStream_t s) {
+    kda_batch_step_slots(x, W, conv_state, 0, S, 0, y, ws, M, s);
+}
+
+// `state_stride` / `conv_stride` in FLOATS. Zero means update in place, which is ordinary
+// autoregression. Non-zero means token m reads slot m and writes slot m+1, leaving one state per
+// position at no extra bandwidth — the same volume is read and written either way, just to a
+// different address. That is what makes a rejected speculative draft free to roll back
+// (SPEC_DECODE.md); with in-place updates there is nothing to roll back to.
+void kda_batch_step_slots(const float* x, const KdaWeights& W,
+                          float* conv_state, size_t conv_stride,
+                          float* S, size_t state_stride,
+                          float* y, float* ws, int M, cudaStream_t s) {
     const size_t MQ = (size_t)M * Q;
     float* qb     = ws;
     float* kb     = ws + MQ;
@@ -331,11 +362,16 @@ void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, floa
     // ---- sequential: the conv window and the recurrence carry state from token to token ----
     for (int m = 0; m < M; ++m) {
         float* qkv_m = q3 + (size_t)m * 3 * Q;
-        k_conv_silu<<<(3 * Q + 255) / 256, 256, 0, s>>>(qkv_m, conv_state, qkv_m,
+        const float* cin = conv_state + (size_t)m * conv_stride;
+        float* cout      = conv_state + (size_t)(m + (conv_stride ? 1 : 0)) * conv_stride;
+        const float* sin = S + (size_t)m * state_stride;
+        float* sout      = S + (size_t)(m + (state_stride ? 1 : 0)) * state_stride;
+        k_conv_silu<<<(3 * Q + 255) / 256, 256, 0, s>>>(qkv_m, cin, cout, qkv_m,
                                                         (const float*)W.conv1d, 3 * Q);
         k_l2norm<<<H, D, 0, s>>>(q_n + (size_t)m * Q, k_n + (size_t)m * Q, qkv_m);
-        kda_recurrence(q_n + (size_t)m * Q, k_n + (size_t)m * Q, qkv_m + 2 * Q,
-                       g + (size_t)m * Q, beta + (size_t)m * H, S, core + (size_t)m * Q, s);
+        kda_recurrence_slots(q_n + (size_t)m * Q, k_n + (size_t)m * Q, qkv_m + 2 * Q,
+                             g + (size_t)m * Q, beta + (size_t)m * H, sin, sout,
+                             core + (size_t)m * Q, s);
         kda_out_norm(core + (size_t)m * Q, gate + (size_t)m * Q, W.o_norm, W.dtype,
                      normed + (size_t)m * Q, s);
     }

@@ -49,6 +49,15 @@ void kda_decode_step(const float* x, const KdaWeights& W,
 void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, float* S,
                     float* y, float* ws, int M, cudaStream_t stream);
 
+// The same, but leaving one state per position instead of one at the end. Strides are in FLOATS;
+// zero means update in place (identical to kda_batch_step). Token m reads slot m and writes slot
+// m+1, so slot j is exactly the state after j tokens — which is what lets a speculative verify
+// that accepts only j of K drafted tokens roll back for free. See SPEC_DECODE.md.
+void kda_batch_step_slots(const float* x, const KdaWeights& W,
+                          float* conv_state, size_t conv_stride,
+                          float* S, size_t state_stride,
+                          float* y, float* ws, int M, cudaStream_t stream);
+
 // Individually gateable stages, exposed so tests/gate_kda.cu can bisect a failure to one stage
 // instead of reporting "the layer is wrong".
 void kda_qkv_conv(const float* x, const KdaWeights& W, float* conv_state, float* qkv, float* ws,
@@ -58,6 +67,9 @@ void kda_gates(const float* x, const KdaWeights& W, float* g, float* beta, float
 void kda_norm_qk(const float* qkv, float* q_n, float* k_n, cudaStream_t stream);
 void kda_recurrence(const float* q_n, const float* k_n, const float* v_in, const float* g,
                     const float* beta, float* S, float* core_out, cudaStream_t stream);
+void kda_recurrence_slots(const float* q_n, const float* k_n, const float* v_in, const float* g,
+                          const float* beta, const float* S_in, float* S_out, float* core_out,
+                          cudaStream_t stream);
 void kda_out_norm(const float* core, const float* gate, const void* o_norm_w, int dtype,
                   float* normed, cudaStream_t stream);
 

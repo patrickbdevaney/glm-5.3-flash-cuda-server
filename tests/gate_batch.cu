@@ -55,6 +55,11 @@ int main(int argc, char** argv) {
     cfg.n_layer   = argc > 2 ? atoi(argv[2]) : 4;      // 4 reaches layer 3: the first MLA + MoE layer
     cfg.max_ctx   = 256;
     cfg.max_batch = 8;
+    // Six slots covers a draft width of 5. With state_slots > 1 the ordinary path is unchanged —
+    // snapshot=false means stride 0, i.e. in place on slot 0 — so the nine checks above still
+    // exercise exactly what they did. At 4 layers the extra five slots cost 64 MiB; a second
+    // Engine would have cost another 13.57 GiB and put an unattended job at risk of the OOM killer.
+    cfg.state_slots = 6;
     cfg.verbose   = true;
 
     printf("=== gate_batch (%d layers) ===\n", cfg.n_layer);
@@ -142,6 +147,36 @@ int main(int argc, char** argv) {
             CU(cudaMemcpy(got.data() + (size_t)t * V, dlog, V * 4, cudaMemcpyDeviceToHost));
         }
         ck(same(ref, got, "batch-then-sequential"), "a batched prefill leaves a usable state");
+    }
+
+    // ---- the rollback property speculation depends on --------------------------------------
+    //
+    // A verify runs K drafted tokens through one forward. If only j are accepted, the engine has
+    // to return to the state after j — and 34 of 45 layers are a RECURRENCE, which has no inverse
+    // and nothing to truncate. The fix (SPEC_DECODE.md) is to have the recurrence write slot m+1
+    // while reading slot m, so slot j simply IS the state after j tokens.
+    //
+    // What this checks is that the claim is true: snapshot a 5-wide forward, accept only j of it,
+    // and then continue token by token. The result must equal a run that never speculated at all.
+    // If slots were off by one, or the conv window did not snapshot alongside the state, this is
+    // where it shows — and nowhere else, because a wrong rollback still produces fluent text.
+    {
+        Engine& seng = eng;
+        for (int j : { 0, 1, 3, 5 }) {
+            std::vector<float> got(V * T);
+            seng.reset(0);
+            seng.forward_batch(toks.data(), 5, 0, dlog, true, 0, /*snapshot=*/true);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(got.data(), dlog, 5 * V * 4, cudaMemcpyDeviceToHost));
+            seng.commit_state_slot(j, 0);           // "only j of the 5 drafts were accepted"
+            for (int t = j; t < T; ++t) {
+                seng.decode(toks[t], t, dlog, 0);
+                CU(cudaDeviceSynchronize());
+                CU(cudaMemcpy(got.data() + (size_t)t * V, dlog, V * 4, cudaMemcpyDeviceToHost));
+            }
+            char tag[64]; snprintf(tag, sizeof tag, "accept %d of 5", j);
+            ck(same(ref, got, tag), tag);
+        }
     }
 
     cudaFree(dlog);

@@ -1,0 +1,21 @@
+=== bench_batch (4 layers) ===
+engine: 1410 tensors, 13.57 GiB resident, 4 layers, max_ctx 512
+engine: 3 KDA layers (12.84 MiB state, context-independent), 1 full-attn layers (1.00 MiB latent cache at 512 ctx)
+streaming read RIGHT NOW: 50.7 GB/s  (idle-box reference is 240; anything well below
+  that means the box is contended and the absolute numbers here are depressed --
+  the RATIOS between widths are what this bench is for)
+
+   K     ms/fwd    ms/token     vs K=1   speedup
+   1      96.04      96.041      1.000     1.00x
+   2      76.89      38.444      0.801     2.50x
+   3     116.21      38.737      1.210     2.48x
+   4     146.21      36.552      1.522     2.63x
+   5     146.10      29.220      1.521     3.29x
+   6     112.08      18.679      1.167     5.14x
+   8     199.53      24.941      2.078     3.85x
+  12     244.76      20.397      2.549     4.71x
+  16     461.90      28.869      4.809     3.33x
+
+'vs K=1' is what ROOFLINE.md §4 predicts as the cost column; 'speedup' is the
+ceiling a verify of that width could reach if every drafted token were accepted.
+RC=0

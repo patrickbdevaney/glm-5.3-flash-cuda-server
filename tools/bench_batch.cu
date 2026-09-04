@@ -12,6 +12,7 @@
 #include "glm5_config.h"
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -71,32 +72,59 @@ int main(int argc, char** argv) {
     std::vector<int> toks(64);
     for (size_t i = 0; i < toks.size(); ++i) toks[i] = 1000 + (int)i * 37;
 
-    printf("%4s %10s %11s %10s %9s\n", "K", "ms/fwd", "ms/token", "vs K=1", "speedup");
-    double base = 0;
-    for (int K : { 1, 2, 3, 4, 5, 6, 8, 12, 16 }) {
-        if (K > cfg.max_batch) break;
-        const int reps = 8;
-        eng.reset(0);
-        eng.forward_batch(toks.data(), K, 0, dlog, true, 0);      // warm
-        CU(cudaDeviceSynchronize());
+    // METHODOLOGY, and it is not optional on a shared box. A first attempt timed each width in one
+    // contiguous block of 8 reps and produced K=2 measuring FASTER than K=1 in absolute ms/forward
+    // — arithmetically impossible, and a clear sign that contention spikes were dominating. So:
+    // every rep is timed individually, the widths are visited ROUND-ROBIN so a spike lands on all
+    // of them alike, and the reported figure is the MINIMUM over reps. The minimum is the right
+    // estimator here: the true cost is a floor set by bandwidth, and every disturbance can only
+    // push a sample above it. The median is printed alongside so the spread is visible — if min
+    // and median are far apart, the box was busy and the run should be repeated.
+    const int WID[] = { 1, 2, 3, 4, 5, 6, 8, 12, 16 };
+    const int NW = (int)(sizeof(WID) / sizeof(WID[0]));
+    const int reps = 32;
+    std::vector<std::vector<double>> t(NW);
 
-        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int w = 0; w < NW; ++w) {                      // warm every width first
+        if (WID[w] > cfg.max_batch) continue;
         eng.reset(0);
-        cudaEventRecord(a);
-        for (int r = 0; r < reps; ++r) eng.forward_batch(toks.data(), K, r * K, dlog, true, 0);
-        cudaEventRecord(b);
-        CU(cudaEventSynchronize(b));
-        float ms = 0; cudaEventElapsedTime(&ms, a, b);
-        cudaEventDestroy(a); cudaEventDestroy(b);
-
-        const double per_fwd = ms / reps;
-        const double per_tok = per_fwd / K;
-        if (K == 1) base = per_fwd;
-        printf("%4d %10.2f %11.3f %10.3f %8.2fx\n", K, per_fwd, per_tok, per_fwd / base,
-               base / per_tok);
+        eng.forward_batch(toks.data(), WID[w], 0, dlog, true, 0);
     }
+    CU(cudaDeviceSynchronize());
+
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int r = 0; r < reps; ++r) {
+        for (int w = 0; w < NW; ++w) {
+            const int K = WID[w];
+            if (K > cfg.max_batch) continue;
+            eng.reset(0);
+            CU(cudaDeviceSynchronize());
+            cudaEventRecord(a);
+            eng.forward_batch(toks.data(), K, 0, dlog, true, 0);
+            cudaEventRecord(b);
+            CU(cudaEventSynchronize(b));
+            float ms = 0; cudaEventElapsedTime(&ms, a, b);
+            t[w].push_back(ms);
+        }
+    }
+    cudaEventDestroy(a); cudaEventDestroy(b);
+
+    printf("%4s %10s %10s %11s %10s %9s\n", "K", "min ms", "med ms", "ms/token", "vs K=1", "speedup");
+    double base = 0;
+    for (int w = 0; w < NW; ++w) {
+        if (t[w].empty()) continue;
+        std::sort(t[w].begin(), t[w].end());
+        const double mn = t[w].front(), md = t[w][t[w].size() / 2];
+        const int K = WID[w];
+        if (K == 1) base = mn;
+        printf("%4d %10.2f %10.2f %11.3f %10.3f %8.2fx\n", K, mn, md, mn / K, mn / base,
+               base / (mn / K));
+    }
+
     printf("\n'vs K=1' is what ROOFLINE.md §4 predicts as the cost column; 'speedup' is the\n"
-           "ceiling a verify of that width could reach if every drafted token were accepted.\n");
+           "ceiling a verify of that width could reach if every drafted token were accepted.\n"
+           "If min and med differ by more than ~15%%, the box was contended and this run is not a\n"
+           "measurement — repeat it when the GPU is idle.\n");
     cudaFree(dlog);
     return 0;
 }
