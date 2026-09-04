@@ -1,0 +1,8 @@
+layer=3
+hidden=4096
+inter=2048
+n_expert=144
+topk=8
+scale=2.5
+limit=10.0
+seed=99

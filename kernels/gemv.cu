@@ -10,8 +10,16 @@
 // and every thread in the block reads a different 16-byte chunk of the same row, so the row is
 // consumed by fully-coalesced 128-byte transactions. x[] is tiny (16 KB at HIDDEN=4096) and hits
 // L2 on every row after the first.
+//
+// ALIGNMENT. The 16-byte vector path is only legal when the weight pointer is 16-byte aligned,
+// and CHECKPOINT TENSORS ARE NOT: safetensors aligns to 4 bytes, so roughly half the tensors in
+// this model sit at offset 4 mod 8 and a float4 load on them faults with "misaligned address".
+// Buffers from cudaMalloc are always fine, which is exactly why this survives a synthetic gate and
+// dies on real weights. gemv() therefore measures alignment at launch and dispatches to a scalar
+// variant when the vector path would be illegal - never assumes.
 #include "gemv.h"
 #include <cuda_bf16.h>
+#include <cstdint>
 
 namespace glm5 {
 
@@ -78,10 +86,60 @@ __global__ void k_gemv_bf16(float* __restrict__ y, const __nv_bfloat16* __restri
     }
 }
 
+// Scalar variants: legal for any alignment the element type itself allows.
+template <int BS>
+__global__ void k_gemv_f32_scalar(float* __restrict__ y, const float* __restrict__ W,
+                                  const float* __restrict__ x, int N, int K) {
+    const int n = blockIdx.x;
+    const float* Wr = W + (size_t)n * K;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < K; i += BS) acc += Wr[i] * x[i];
+    __shared__ float red[BS / 32];
+    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        acc = (lane < BS / 32) ? red[lane] : 0.f;
+        for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        if (lane == 0) y[n] = acc;
+    }
+}
+
+template <int BS>
+__global__ void k_gemv_bf16_scalar(float* __restrict__ y, const __nv_bfloat16* __restrict__ W,
+                                   const float* __restrict__ x, int N, int K) {
+    const int n = blockIdx.x;
+    const __nv_bfloat16* Wr = W + (size_t)n * K;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < K; i += BS) acc += __bfloat162float(Wr[i]) * x[i];
+    __shared__ float red[BS / 32];
+    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        acc = (lane < BS / 32) ? red[lane] : 0.f;
+        for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        if (lane == 0) y[n] = acc;
+    }
+}
+
+// True only when EVERY row start is 16-byte aligned: the base must be, and so must the row stride,
+// or row 1 lands misaligned even though row 0 is fine.
+static inline bool vec16_ok(const void* p, int K, int elem_bytes) {
+    return (((uintptr_t)p & 15) == 0) && ((((size_t)K * elem_bytes) & 15) == 0);
+}
+
 void gemv(float* y, const void* W, const float* x, int N, int K, int dtype, cudaStream_t s) {
     constexpr int BS = 256;
-    if (dtype == GEMV_F32) k_gemv_f32<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K);
-    else                   k_gemv_bf16<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);
+    if (dtype == GEMV_F32) {
+        if (vec16_ok(W, K, 4)) k_gemv_f32<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K);
+        else                   k_gemv_f32_scalar<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K);
+    } else {
+        if (vec16_ok(W, K, 2)) k_gemv_bf16<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);
+        else                   k_gemv_bf16_scalar<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);
+    }
 }
 
 }  // namespace glm5
