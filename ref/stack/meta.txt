@@ -1,0 +1,5 @@
+layers=3
+steps=4
+hc_mult=4
+hidden=4096
+seed=11

@@ -148,7 +148,21 @@ public:
                 }
             } else j.skip_value();
         } while (j.eat(','));
-        auto keep = [&](const std::string& n){ return !only_prefix || n.find(only_prefix) != std::string::npos; };
+        // only_prefix is a COMMA-SEPARATED list of substrings; a tensor is kept if ANY matches.
+        // The engine uses this to load a layer subset ("layers.0.,layers.1.,...") for smoke tests
+        // on a box that cannot currently hold the whole 98 GiB checkpoint.
+        std::vector<std::string> pats;
+        if (only_prefix) {
+            std::string all(only_prefix), cur;
+            for (char c : all) { if (c == ',') { if (!cur.empty()) pats.push_back(cur); cur.clear(); }
+                                 else cur.push_back(c); }
+            if (!cur.empty()) pats.push_back(cur);
+        }
+        auto keep = [&](const std::string& n){
+            if (pats.empty()) return true;
+            for (auto& p : pats) if (n.find(p) != std::string::npos) return true;
+            return false;
+        };
         // Open shards referenced by kept tensors; skip shards that don't exist (partial download).
         for (auto& kv : weight_map_) {
             if (!keep(kv.first)) continue;
