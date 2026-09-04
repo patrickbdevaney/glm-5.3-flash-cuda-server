@@ -1,0 +1,7 @@
+layer=0
+hc_mult=4
+hidden=4096
+prefill=9
+seed=7
+block=linear_attention
+mlp=dense

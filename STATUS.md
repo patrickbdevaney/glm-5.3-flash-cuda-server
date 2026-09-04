@@ -15,9 +15,17 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | architecture mapped from the checkpoint | **done** — `ARCH_DELTA.md` |
 | roofline measured | **done** — `ROOFLINE.md`, `tools/roofline.py` |
 | port verdict per subsystem | **done** — one NEW (KDA), three RETARGET, rest PORT |
-| kernels | not started |
-| engine | not started |
-| server | not started |
+| **KDA** (47.4% of `B_tok`) | **gated cosine-1.0**, 15/15, both dtypes — `tests/gate_kda.cu` |
+| **MoE** (28.9%) | **gated cosine-1.0**, real packed NVFP4 from the shards — `tests/gate_moe.cu` |
+| **mHC + norms + dense MLP** | **gated cosine-1.0** — inside `tests/gate_layer.cu` |
+| **complete decoder layer 0** | **gated cosine-1.0**, 12/12 end-to-end — `tests/gate_layer.cu` |
+| MLA + DSA indexer (13.9%) | not started — the last kernel subsystem |
+| engine (45 layers + lm_head) | not started |
+| tokenizer / HTTP server | not started (ports from `0731`) |
+| MTP + speculative decode | not started |
+
+**76.3% of per-token bandwidth is now implemented and gated against `transformers` on real
+checkpoint weights.**
 
 ## The two findings that set the agenda
 
@@ -31,5 +39,19 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 
 ## Next
 
-Kernels bottom-up, each gated on real weights: elementwise → NVFP4 GEMV → KDA → HC → MoE →
-MLA/DSA → engine → server. KDA first: it is the new surface and the largest single cost.
+1. **MLA + DSA indexer** — 11 full-attention layers, 13.9% of `B_tok`. Pure NoPE (no rotary in
+   main attention), so the rope half of the 0731 kernel is not needed. The indexer's k-pooling
+   (`kpool` 4 + compress gate + APE) is genuinely new; `index_topk` is 2048, not 512.
+   Decode should absorb `kv_b_proj` into the query so only the 512-wide latent is cached.
+2. **Engine**: embed → 45 layers → HyperHead mean → final norm → lm_head.
+3. **Server**: tokenizer (GLM vocab 154 880, three EOS ids), HTTP/OpenAI, SSE.
+4. **Then, and only then, speculation** — with the batch-cost curve measured first, because that
+   is what decided it on GGUF.
+
+## Two things the build has already changed
+
+- **`B_tok` is the lever, not the kernels.** KDA runs at the machine's achievable bandwidth
+  already (`OPTIMIZATION_LOG` #1). The 51% `B_tok` cut from quantising the bf16 dense weights
+  (`ROOFLINE` §3) is worth more than any kernel work left on the table.
+- **Gate on real weights or do not bother.** Both "misaligned address" faults (`OPTIMIZATION_LOG`
+  #2) were invisible to synthetic fixtures and fatal on the checkpoint.

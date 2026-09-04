@@ -153,3 +153,13 @@ void f32_to_bf16(void* dst, const float* src, size_t n, cudaStream_t s) {
     k_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256, 0, s>>>((__nv_bfloat16*)dst, src, n);
 }
 }
+
+namespace glm5 {
+__global__ void k_bf16_to_f32(float* d, const __nv_bfloat16* s, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = __bfloat162float(s[i]);
+}
+void f32_from_bf16_dev(float* dst, const void* src, size_t n, cudaStream_t s) {
+    k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(dst, (const __nv_bfloat16*)src, n);
+}
+}
