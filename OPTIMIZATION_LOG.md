@@ -79,3 +79,51 @@ kernel that works perfectly on oracle fixtures dies on the real model.
 
 `nvfp4_check_align()` asserts the 4-byte floor at load time, so a checkpoint that breaks even that
 is caught at startup rather than mid-request.
+
+---
+
+## #3 — MLA gated, and the DSA indexer proved unnecessary below 2048 context (2026-09-04)
+
+`tests/gate_mla.cu`, layer 3, weights from the checkpoint: **4/4 cos 1.000000000**
+(`q_resid`, `q`, the stored latent, and the attention output).
+
+### Two findings that shrink the remaining work
+
+**1. MLA here is pure NoPE.** `qk_rope_head_dim = 0` and `mla_use_nope = true`, so there is no
+rotary embedding anywhere in the main attention path — no YaRN, no rope cache, no interleave.
+Position reaches these 11 layers only through the 34 KDA layers below them. DeepSeek-V4's
+`yarn.h` and the rope half of its MLA kernel are not needed at all.
+
+**2. Below 2048 tokens of context the DSA indexer is a no-op**, and this is *verified*, not
+assumed. The indexer pools keys in groups of `index_kpool` = 4 and selects
+`min(index_topk / index_kpool, n_pools)` = `min(512, n_pools)`. At `n_pools <= 512` — i.e.
+context <= 2048 — every pool is selectable, and `index_kpool_always_select_tail` appends the
+trailing incomplete pool. `ref/gen_mla.py` calls the **real** `get_pooled_states` /
+`get_visible_tokens` and checks the covered set against the full visible set:
+
+    DSA at T=38: 9 pools, select_k=9, covers all 38 positions: True
+
+So dense causal MLA is **exact**, not an approximation, up to 2048 context. The indexer (0.8% of
+`B_tok`, and the most intricate kernel left) is only needed to go beyond that — which makes a
+correct end-to-end engine reachable without it.
+
+### The absorbed form
+
+Decode folds `W_k` into the query rather than expanding the latent per head:
+
+    qa[h]   = W_k[h]^T q[h]            [512]     kv_b read once
+    s[h][t] = qa[h] . C[t] * scaling             attention runs on the latent itself
+    ctx[h]  = sum_t a[h][t] C[t]       [512]
+    o[h]    = W_v[h] ctx[h]            [256]     expand once, at the end
+
+Algebraically identical — the oracle measures the difference at **7.45e-07** — and it is why only
+the 512-wide latent is cached: **88 MiB at 8k context across all 11 layers**, against 1408 MiB for
+the expanded form.
+
+### Kernel layout notes
+
+`k_scores` uses one block per tile of 8 cached tokens and loops all 64 heads, so **the latent
+cache is read once per block**. The obvious layout — one block per (head, token) — re-reads it 64
+times, which at 8k context is 268 MB per layer per token instead of 16 MB. `k_context` uses
+head-groups of 16 for the same reason (4x amplification instead of 64x). Neither is measured yet;
+both are structural choices made to avoid a known-bad access pattern, and the ladder stays open.

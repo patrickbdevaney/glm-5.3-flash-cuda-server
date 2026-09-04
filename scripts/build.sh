@@ -4,9 +4,9 @@
 set -e; cd "$(dirname "$0")/.."
 mkdir -p build
 ARCH="-gencode arch=compute_110a,code=sm_110a"
-K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/gemv.cu"
+K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu"
 
-for g in gate_kda gate_moe gate_layer; do
+for g in gate_kda gate_moe gate_layer gate_mla; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $K -o build/$g && echo "built build/$g"
 done
 for t in bench_kda; do

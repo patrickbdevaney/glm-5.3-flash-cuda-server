@@ -19,13 +19,16 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **MoE** (28.9%) | **gated cosine-1.0**, real packed NVFP4 from the shards — `tests/gate_moe.cu` |
 | **mHC + norms + dense MLP** | **gated cosine-1.0** — inside `tests/gate_layer.cu` |
 | **complete decoder layer 0** | **gated cosine-1.0**, 12/12 end-to-end — `tests/gate_layer.cu` |
-| MLA + DSA indexer (13.9%) | not started — the last kernel subsystem |
+| **MLA full attention** (13.1%) | **gated cosine-1.0**, 4/4 — `tests/gate_mla.cu` |
+| DSA indexer (0.8%) | not started — **only needed above 2048 context** (verified) |
 | engine (45 layers + lm_head) | not started |
 | tokenizer / HTTP server | not started (ports from `0731`) |
 | MTP + speculative decode | not started |
 
-**76.3% of per-token bandwidth is now implemented and gated against `transformers` on real
-checkpoint weights.**
+**92.9% of per-token bandwidth is now implemented and gated against `transformers` on real
+checkpoint weights.** Everything remaining on the AR path is `lm_head` (6.4%), which is a gemv
+that already exists and needs wiring, and the DSA indexer, which does not affect results below
+2048 tokens of context.
 
 ## The two findings that set the agenda
 
@@ -39,12 +42,12 @@ checkpoint weights.**
 
 ## Next
 
-1. **MLA + DSA indexer** — 11 full-attention layers, 13.9% of `B_tok`. Pure NoPE (no rotary in
-   main attention), so the rope half of the 0731 kernel is not needed. The indexer's k-pooling
-   (`kpool` 4 + compress gate + APE) is genuinely new; `index_topk` is 2048, not 512.
-   Decode should absorb `kv_b_proj` into the query so only the 512-wide latent is cached.
-2. **Engine**: embed → 45 layers → HyperHead mean → final norm → lm_head.
-3. **Server**: tokenizer (GLM vocab 154 880, three EOS ids), HTTP/OpenAI, SSE.
+1. **Engine**: embed → 45 layers → HyperHead mean → final norm → lm_head. Every kernel it needs
+   for context <= 2048 now exists and is gated. This is the next milestone and it is a wiring
+   job, not a kernel job.
+2. **Server**: tokenizer (GLM vocab 154 880, three EOS ids), HTTP/OpenAI, SSE — ports from `0731`.
+3. **DSA indexer**, to go past 2048 context. k-pooling (`kpool` 4 + compress gate + APE) is new;
+   `index_topk` is 2048, not 512.
 4. **Then, and only then, speculation** — with the batch-cost curve measured first, because that
    is what decided it on GGUF.
 

@@ -1,0 +1,177 @@
+// mla.cu — Multi-head Latent Attention, decode step, for the 11 full-attention layers.
+//
+// 13.1% of B_tok. Two things make this model's MLA simpler than DeepSeek-V4's:
+//   * qk_rope_head_dim == 0 and mla_use_nope == true, so there is NO rotary embedding in the main
+//     attention path at all — no YaRN, no rope cache, no interleave. Position information reaches
+//     these layers through the 34 KDA layers beneath them.
+//   * there is no o_lora / o_groups factorisation; o_proj is one [4096, 16384] matrix.
+//
+// The decode path uses the ABSORBED form. Instead of expanding the 512-wide latent into 64 heads
+// of (256 key + 256 value) per cached token, W_k is folded into the query once:
+//
+//     qa[h] = W_k[h]^T q[h]                    [512]      64 x (256x512), read kv_b once
+//     s[h][t] = qa[h] . C[t] * scaling                    attention runs on the latent directly
+//     ctx[h] = sum_t a[h][t] C[t]              [512]
+//     o[h]   = W_v[h] ctx[h]                   [256]      expand only once, at the end
+//
+// This is algebraically identical to expanding (ref/gen_mla.py measures the difference at ~1e-6)
+// and it is why only the 512-wide latent needs caching: 88 MiB at 8k context across all 11 layers,
+// against 1408 MiB for the expanded form.
+#include "mla.h"
+#include "gemv.h"
+#include "layer.h"
+#include "glm5_config.h"
+#include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdint>
+
+namespace glm5 {
+
+static constexpr int Hh = MLA_HEADS;      // 64
+static constexpr int Dq = MLA_QK_NOPE;    // 256
+static constexpr int Dv = MLA_V_HEAD;     // 256
+static constexpr int Lk = MLA_KV_LORA;    // 512
+static constexpr int ROW = Dq + Dv;       // 512 rows of kv_b per head
+
+// workspace: q_resid[1536] | q[16384] | c_new[512] | qa[64*512] | scores[64*max_ctx] |
+//            ctx[64*512] | heads[16384]
+size_t mla_workspace_floats(int max_ctx) {
+    return MLA_Q_LORA + MLA_Q_DIM + Lk + (size_t)Hh * Lk + (size_t)Hh * max_ctx
+         + (size_t)Hh * Lk + (size_t)Hh * Dv;
+}
+
+// qa[h][l] = sum_{d<256} q[h][d] * kv_b[(h*512 + d)*512 + l]
+// One block per head, 512 threads, thread l owns output column l. For a fixed d all 512 threads
+// read 512 consecutive bf16 — one fully-coalesced 1 KB row per step.
+__global__ void k_absorb_q(float* __restrict__ qa, const float* __restrict__ q,
+                           const __nv_bfloat16* __restrict__ kv_b) {
+    const int h = blockIdx.x, l = threadIdx.x;
+    const __nv_bfloat16* Wk = kv_b + (size_t)h * ROW * Lk;
+    float acc = 0.f;
+    for (int d = 0; d < Dq; ++d) acc += q[(size_t)h * Dq + d] * __bfloat162float(Wk[(size_t)d * Lk + l]);
+    qa[(size_t)h * Lk + l] = acc;
+}
+
+// s[h][t] = qa[h] . C[t] * scaling
+//
+// One block per tile of 8 cached tokens, looping all 64 heads. The LATENT CACHE IS READ ONCE per
+// block — the obvious layout (one block per (head, token)) would re-read it 64 times, which at 8k
+// context is 268 MB per layer per token instead of 16 MB. qa is only 128 KB and stays in L2.
+template <int TT>
+__global__ void k_scores(float* __restrict__ scores, const float* __restrict__ qa,
+                         const float* __restrict__ cache, int n_tok, int max_ctx, float scaling) {
+    __shared__ float Ct[TT][Lk];
+    const int t0 = blockIdx.x * TT;
+    for (int i = threadIdx.x; i < TT * Lk; i += blockDim.x) {
+        const int tt = i / Lk, l = i - tt * Lk;
+        Ct[tt][l] = (t0 + tt < n_tok) ? cache[(size_t)(t0 + tt) * Lk + l] : 0.f;
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;   // TT warps, one per token
+    if (warp >= TT || t0 + warp >= n_tok) return;
+    for (int h = 0; h < Hh; ++h) {
+        float acc = 0.f;
+        for (int l = lane; l < Lk; l += 32) acc += qa[(size_t)h * Lk + l] * Ct[warp][l];
+        for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        if (lane == 0) scores[(size_t)h * max_ctx + t0 + warp] = acc * scaling;
+    }
+}
+
+// softmax over the n_tok visible positions, one block per head.
+template <int BS>
+__global__ void k_softmax(float* __restrict__ s, int n_tok, int max_ctx) {
+    const int h = blockIdx.x;
+    float* row = s + (size_t)h * max_ctx;
+    __shared__ float rm[BS / 32], rs[BS / 32];
+    float m = -1e30f;
+    for (int t = threadIdx.x; t < n_tok; t += BS) m = fmaxf(m, row[t]);
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+    if ((threadIdx.x & 31) == 0) rm[threadIdx.x >> 5] = m;
+    __syncthreads();
+    __shared__ float mx;
+    if (threadIdx.x == 0) { float v = -1e30f; for (int k = 0; k < BS / 32; ++k) v = fmaxf(v, rm[k]); mx = v; }
+    __syncthreads();
+    float sum = 0.f;
+    for (int t = threadIdx.x; t < n_tok; t += BS) { const float e = __expf(row[t] - mx); row[t] = e; sum += e; }
+    for (int o = 16; o; o >>= 1) sum += __shfl_down_sync(0xffffffff, sum, o);
+    if ((threadIdx.x & 31) == 0) rs[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    __shared__ float tot;
+    if (threadIdx.x == 0) { float v = 0; for (int k = 0; k < BS / 32; ++k) v += rs[k]; tot = v; }
+    __syncthreads();
+    for (int t = threadIdx.x; t < n_tok; t += BS) row[t] /= tot;
+}
+
+// ctx[h][l] = sum_t a[h][t] * C[t][l]
+// One block per group of HG heads, 512 threads (one per latent lane). C[t][l] is read once per
+// head-group rather than once per head: 4x amplification instead of 64x.
+template <int HG>
+__global__ void k_context(float* __restrict__ ctx, const float* __restrict__ s,
+                          const float* __restrict__ cache, int n_tok, int max_ctx) {
+    const int h0 = blockIdx.x * HG, l = threadIdx.x;
+    float acc[HG];
+    #pragma unroll
+    for (int i = 0; i < HG; ++i) acc[i] = 0.f;
+    for (int t = 0; t < n_tok; ++t) {
+        const float c = cache[(size_t)t * Lk + l];       // coalesced across threads
+        #pragma unroll
+        for (int i = 0; i < HG; ++i) acc[i] += s[(size_t)(h0 + i) * max_ctx + t] * c;
+    }
+    #pragma unroll
+    for (int i = 0; i < HG; ++i) ctx[(size_t)(h0 + i) * Lk + l] = acc[i];
+}
+
+// o[h][d] = sum_l ctx[h][l] * kv_b[(h*512 + 256 + d)*512 + l]
+// One block per (head, output dim); each block streams one contiguous 512-element bf16 row.
+template <int BS>
+__global__ void k_expand_v(float* __restrict__ out, const float* __restrict__ ctx,
+                           const __nv_bfloat16* __restrict__ kv_b) {
+    const int h = blockIdx.x / Dv, d = blockIdx.x - h * Dv;
+    const __nv_bfloat16* Wv = kv_b + ((size_t)h * ROW + Dq + d) * Lk;
+    const float* c = ctx + (size_t)h * Lk;
+    float acc = 0.f;
+    for (int l = threadIdx.x; l < Lk; l += BS) acc += c[l] * __bfloat162float(Wv[l]);
+    __shared__ float red[BS / 32];
+    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) { float v = 0; for (int k = 0; k < BS / 32; ++k) v += red[k]; out[(size_t)h * Dv + d] = v; }
+}
+
+__global__ void k_store_latent(float* __restrict__ cache, const float* __restrict__ c_new, int t) {
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l < Lk) cache[(size_t)t * Lk + l] = c_new[l];
+}
+
+void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, int max_ctx,
+                     float* y, float* ws, cudaStream_t s) {
+    float* q_resid = ws;
+    float* q       = ws + MLA_Q_LORA;
+    float* c_new   = q + MLA_Q_DIM;
+    float* qa      = c_new + Lk;
+    float* scores  = qa + (size_t)Hh * Lk;
+    float* ctx     = scores + (size_t)Hh * max_ctx;
+    float* heads   = ctx + (size_t)Hh * Lk;
+    const int n_tok = t + 1;
+    const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));   // 1/16
+
+    gemv(q_resid, W.q_a, x, MLA_Q_LORA, HIDDEN, W.dtype, s);
+    rmsnorm(q_resid, q_resid, W.q_a_norm, W.dtype, MLA_Q_LORA, s);
+    gemv(q, W.q_b, q_resid, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+
+    gemv(c_new, W.kv_a, x, Lk, HIDDEN, W.dtype, s);
+    rmsnorm(c_new, c_new, W.kv_a_norm, W.dtype, Lk, s);
+    k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new, t);
+
+    k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
+    constexpr int TT = 8;
+    k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+    k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
+    constexpr int HG = 16;
+    k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+    k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
+    gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
+}
+
+}  // namespace glm5

@@ -4,7 +4,7 @@
 #   for g in kda moe layer; do ./.venv/bin/python ~/glm-5.3-flash-cuda-server/ref/gen_$g.py; done
 set -u; cd "$(dirname "$0")/.."
 rc=0
-for g in gate_kda gate_moe gate_layer; do
+for g in gate_kda gate_moe gate_layer gate_mla; do
   [ -x build/$g ] || { echo "MISSING build/$g - run scripts/build.sh"; rc=1; continue; }
   echo "=== $g ==="
   ./build/$g || rc=1

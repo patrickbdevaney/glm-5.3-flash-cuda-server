@@ -1,0 +1,12 @@
+layer=3
+T=38
+heads=64
+qk_nope=256
+v_head=256
+kv_lora=512
+q_lora=1536
+scaling=0.0625
+n_pool=9
+select_k=9
+dense=True
+seed=5
