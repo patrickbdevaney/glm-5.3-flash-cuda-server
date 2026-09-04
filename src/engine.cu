@@ -36,8 +36,13 @@ static float* dalloc(std::vector<void*>& owned, size_t n_float, double* acc = nu
 }
 
 Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
-    if (cfg_.max_ctx > IDX_TOPK)
-        throw std::runtime_error("max_ctx > " + std::to_string(IDX_TOPK) +
+    // The dense-MLA limit is NOT index_topk. A trailing INCOMPLETE k-pool is never selectable
+    // (pool_valid needs all 4 tokens) but its tokens are appended raw by append_visible_tail, so a
+    // context of 2051 still has every token visible to every query. 2052 is the first length at
+    // which the indexer actually drops something. Measured against the real module in
+    // ref/gen_indexer.py, not derived from reading it.
+    if (cfg_.max_ctx > DENSE_CTX_LIMIT)
+        throw std::runtime_error("max_ctx > " + std::to_string(DENSE_CTX_LIMIT) +
                                  " requires the DSA indexer, which is not implemented yet");
 
     // Load only what the requested layer count needs. On a box that cannot currently hold the

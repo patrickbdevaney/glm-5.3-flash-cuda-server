@@ -1,0 +1,16 @@
+{
+ "layer": 3,
+ "index_topk": 2048,
+ "index_kpool": 4,
+ "always_select_tail": true,
+ "n_heads": 32,
+ "head_dim": 128,
+ "softmax_scale": 0.08838834764831845,
+ "output_width": 2051,
+ "dumped": [
+  38,
+  2050,
+  3001,
+  3003
+ ]
+}

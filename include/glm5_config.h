@@ -70,6 +70,10 @@ constexpr int IDX_HEADS         = 32;
 constexpr int IDX_HEAD_DIM      = 128;
 constexpr int IDX_TOPK          = 2048;
 constexpr int IDX_KPOOL         = 4;         // k-pooling with compress gate + APE (new vs 0731)
+// Longest context for which dense MLA is EXACT, i.e. the indexer selects every token.
+// = IDX_TOPK + IDX_KPOOL - 1, because the trailing incomplete pool is unselectable but its tokens
+// are appended raw. Verified against the real indexer in ref/gen_indexer.py: 2051 dense, 2052 not.
+constexpr int DENSE_CTX_LIMIT   = IDX_TOPK + IDX_KPOOL - 1;
 
 // ---- MoE ----
 constexpr int N_ROUTED_EXPERT   = 144;       // REAP-50 pruned from 288

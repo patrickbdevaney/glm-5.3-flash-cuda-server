@@ -122,3 +122,38 @@ save 0.7% of `B_tok` — not worth it.
 - **3-stage DSpark head** — GLM's MTP is a single ordinary layer.
 - **Vision tower** — deferred, not dropped. Weights stay resident-capable; the text AR path
   simply never reads them.
+
+---
+
+## DSA indexer — semantics read from the module, and a correction to the dense limit
+
+Previously recorded as "dense MLA is exact below 2048". **That is off by three.** Measured against
+the real `Glm5NextTextIndexer` in `ref/gen_indexer.py`:
+
+| context | pools | select_k | tail | distinct tokens the last query sees | |
+|---|---|---|---|---|---|
+| 2048 | 512 | 512 | 0 | 2048 of 2048 | dense |
+| 2050 | **513** | 512 | 2 | 2050 of 2050 | **still dense** |
+| 2051 | 513 | 512 | 3 | 2051 of 2051 | **still dense** |
+| 2052 | 513 | 512 | 0 | 2048 of 2052 | first sparse length |
+
+A trailing **incomplete** pool is never selectable — `pool_valid` requires all `index_kpool` tokens
+to be present — but `append_visible_tail` appends its tokens raw anyway. So 513 pools with only 512
+selected is still complete coverage whenever the 513th is a fragment. The limit is
+`floor(T / index_kpool) <= index_topk / index_kpool`, i.e. **`DENSE_CTX_LIMIT = IDX_TOPK +
+IDX_KPOOL - 1 = 2051`**, and the engine's guard now uses that rather than 2048.
+
+Three more facts a kernel will need, none of them guessable from the config:
+
+- Output width is **constant at 2051** (`index_topk + index_kpool - 1`), at every context length,
+  padded with -1.
+- Pooling starts at the **first valid key**, not at slot 0, so with left padding the pool grid is
+  offset. At decode with no padding that offset is zero.
+- `k_norm` is a **LayerNorm with a bias**, eps 1e-6 — not the RMSNorm used everywhere else in this
+  model. Reusing the model's own norm here would be wrong in a way that still produces plausible
+  scores.
+
+Pool keys are a softmax-weighted average over each complete pool of
+(`index_kpool_compress_gate @ hidden` + `index_kpool_compress_ape`), so **they are fixed once a
+pool's 4 tokens exist** — the kernel should compute each pool key once on completion and cache it,
+not recompute 512 of them per decode step.
