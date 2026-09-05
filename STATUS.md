@@ -30,12 +30,40 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **sampler / stream / API** | **gated**, 44 checks, no GPU needed |
 | **HTTP server** | **running** — OpenAI chat + completions, SSE, tools, prefix reuse; 19/19 live smoke |
 | MTP + speculative decode | designed and costed, not built — `SPEC_DECODE.md` |
+| **full 45-layer engine** | **RUNNING** — 57,604 tensors, 98.49 GiB resident, loads in ~80 s; serves coherent text |
 
 **The context limit is gone.** A 4,073-token prompt now serves end to end; the engine ran dense
 below 2051 and switched to the indexer above it. **92.9% of per-token bandwidth is implemented and gated against `transformers` on real
 checkpoint weights.** Everything remaining on the AR path is `lm_head` (6.4%), which is a gemv
 that already exists and needs wiring, and the DSA indexer, which does not affect results below
 2048 tokens of context.
+
+## The full model runs
+
+`scripts/run_full.sh --seqmax 8192` brings up all 45 layers: **57,604 tensors, 98.49 GiB
+resident**, loaded in ~80 s, answering on the OpenAI endpoint with coherent, on-topic text.
+
+**Decode is 3.4 tok/s against a roofline of 11.7** (231.5 GB/s measured with the model resident,
+divided by `B_tok` = 19.761 G). So 29% of roofline — the same shortfall the DSpark CUDA server hit
+(7.89 tok/s, ~25%), and the same diagnosis: the gap is *kernel efficiency, not algorithm*. The
+recorded top lever is a hardware-unpack FP4 MoE GEMV. Note this is measured BEFORE the -51% `B_tok`
+win from NVFP4-ing the bf16 dense weights (§3), which moves the roofline, not the efficiency.
+
+`include/dprof.h` is ported but **not wired into any kernel here** — attributing the 3.4-vs-11.7 gap
+to a sub-op needs those marks placed first. That is the next measurement, and it is cheap.
+
+### Two operational rules this run established
+
+**Never probe for the cudaMalloc ceiling.** On Thor `cudaMalloc` draws from the same DRAM as
+everything else, so over-allocation is a *global OOM kill*, not an error return. An
+allocate-until-failure probe took down the Claude Code session, `gnome-software` and
+`update-manager` before it died itself. Size the load by summing safetensors headers instead.
+
+**Reclaim the driver page pool before a big load.** After a large CUDA process exits, its memory
+does not come back on its own: `free` reports it *used* while `AnonPages`, `Cached`, `Slab` and
+nvmap's own accounting are all tiny. `sync; echo 3 > /proc/sys/vm/drop_caches` recovered 96 GiB
+(22 GiB available -> 118). `scripts/run_full.sh` also raises its own `oom_score_adj` to 1000, so a
+bad sizing costs a restart rather than the session.
 
 ## The two findings that set the agenda
 

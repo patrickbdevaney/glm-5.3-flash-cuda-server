@@ -1,0 +1,7 @@
+[server] tokenizer /home/patrickd/glm-5.3-reap/output/glm-5.3-flash-reap50-nvfp4-pass2/tokenizer.json
+[server] tokenizer ok (vocab 154820, 36 added, eos 154820/154827/154829)
+engine: 57604 tensors, 98.15 GiB resident, 45 layers, max_ctx 8192
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (176.00 MiB latent cache at 8192 ctx)
+
+[server] listening on http://0.0.0.0:8099   (web UI at /)
+[server] model glm-5.3-flash-reap50-nvfp4, 45 layers, 98.49 GiB resident, max_ctx 8192
