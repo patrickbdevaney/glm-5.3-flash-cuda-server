@@ -10,6 +10,7 @@
 //     are the UNBIASED sigmoid scores;
 //   * n_group == topk_group == 1, so the group mask selects everything and is a no-op here.
 #include "moe.h"
+#include "dprof.h"
 #include "gemv.h"
 #include "glm5_config.h"
 #include <cstdio>
@@ -192,9 +193,15 @@ void moe_forward(const float* x, const MoeLayer& L, float* y, int32_t* sel, floa
     constexpr int BS = 128;
     float* logits = ws;
     float* act    = ws + N_ROUTED_EXPERT;
+    dprof_begin(DP_E_ROUTER, s);
     moe_route(x, L, sel, wts, logits, s);
+    dprof_end(DP_E_ROUTER, s);
+    dprof_begin(DP_E_ACT, s);
     k_expert_act<BS><<<dim3(I, NS), BS, 0, s>>>(act, x, L.experts, L.shared, sel, I, H, SWIGLU_LIMIT);
+    dprof_end(DP_E_ACT, s);
+    dprof_begin(DP_E_DOWN, s);
     k_expert_down<BS><<<H, BS, 0, s>>>(y, act, L.experts, L.shared, sel, wts, I, H);
+    dprof_end(DP_E_DOWN, s);
 }
 
 }  // namespace glm5

@@ -333,3 +333,69 @@ first 512 pools — which is most of the context it then has to score.
 and scoring every pool to conclude "all of them" is wasted work. `force_sparse` exists purely so
 the gate can exercise the sparse kernels where a known answer exists; without it that gate would
 have been comparing dense against dense and passing vacuously — which it briefly did.
+
+---
+
+## #9 — The decode gap is the MoE, and it inverts the optimisation order
+
+`tools/bench_decode.cu`, 45 layers, 24 steps, 512 ctx, **246.8 GB/s measured in-process with the
+model resident**. 3.94 tok/s against a 12.49 roofline = **32%**.
+
+```
+phase                        ms       %    calls     GB/tok     GB/s     %BW
+ATTENTION               1638.11   27.0%     1080     11.950    175.1     71%
+FFN                     4145.85   68.2%     1080      6.307     36.5     15%
+lm_head                  142.94    2.4%       24      1.269    213.1     86%
+  attn:kda              1260.73   20.8%      816      9.366    178.3     72%
+    kda:qkv+conv         780.02   12.8%      816      6.850    210.8     85%
+    kda:o_proj           260.41    4.3%      816      2.283    210.4     85%
+    kda:gates            167.00    2.7%      816      0.500     71.9     29%
+  ffn:moe               4037.94   66.5%     1008      5.401     33.9     14%
+    moe:w13+act         2608.75   42.9%     1008      3.568     32.8     13%
+    moe:w2+combine      1396.25   23.0%     1008      1.783     30.7     12%
+TOTAL                   6074.75  (253.11 ms/step, 3.95 tok/s)
+```
+
+**The MoE holds 66.5% of the step while moving 27% of the bytes, at 13% of achievable
+bandwidth.** Everything else is already close to the machine: the KDA projections and `lm_head`
+run at 85–86%, KDA as a whole at 72%, MLA at 67%. There is no diffuse inefficiency to hunt —
+one kernel family owns the entire gap.
+
+At the 85% the KDA gemvs already demonstrate, `ffn:moe` would take 617 ms instead of 4038, and
+the step would fall to 110.6 ms — **9.04 tok/s, a 2.29x speedup from one kernel family**.
+
+### This reverses ROOFLINE §3
+
+§3 calls NVFP4-ing the bf16 dense weights "worth more than every kernel optimisation combined",
+on a −51% `B_tok`. That arithmetic silently assumes every phase converts bytes to time at the
+same rate. **They do not**, and the phases §3 targets — KDA, MLA, `lm_head` — are exactly the
+ones already at 72–86%. Halving their bytes saves ~890 ms of 6075:
+
+| order | step | result |
+|---|---|---|
+| NVFP4 dense weights first | 6075 -> 5188 ms | 4.63 tok/s (**1.17x**) |
+| fix the MoE kernels first | 6075 -> 2654 ms | 9.04 tok/s (**2.29x**) |
+| then NVFP4 on top of that  | 2654 -> 1764 ms | 13.6 tok/s (1.50x more) |
+
+Same two changes, and doing the cheap-looking one first buys 1.17x instead of 2.29x. **Fix the
+MoE kernels first.** This also matches the recorded prior on this box (`dspark-decode-gap-research`:
+"top lever = HW-unpack FP4 MoE GEMV") — arrived at there by a different route, on a different model.
+
+### A wrong number the profile caught on its way past
+
+`moe:router` reported **313 GB/s on a 247 GB/s machine**, and `mla:indexer` 180%. A phase cannot
+beat the memory system, so an impossible row means the byte count on that row is wrong, not the
+kernel. The router's was: `roofline.py` bucketed on `body.startswith('mlp.gate')`, which also
+prefixes `mlp.gate_proj.weight` — the SwiGLU gate of the three DENSE MLPs, a `[12288, 4096]` bf16
+that is 6x the real `[144, 4096]` router. `moe router` read 0.352 G instead of 0.051 G, and
+`dense mlp` was under-reported by the same 0.302 G.
+
+`B_tok` is unaffected at **19.761 G** — both buckets were already inside it, so this is a
+reclassification, not a correction to the headline. Fixed with one character (`'mlp.gate.'`).
+`mla:indexer`'s 180% is different and legitimate: 0.164 G is a long-context figure and this bench
+runs at 512 ctx. Those cells now print a dash rather than a number that would invite a wrong lever.
+
+### Secondary targets, once the MoE is fixed
+
+`kda:gates` at 29% (167 ms) and the two `hc:` compose marks at 6% (119 ms combined) are together
+4.7% of the step — worth having, worth nothing before the MoE.

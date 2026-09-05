@@ -13,6 +13,7 @@
 // Above 2048 the indexer is required and the engine refuses rather than quietly returning
 // attention over the wrong set of keys.
 #include "engine.h"
+#include "dprof.h"
 #include "gemv.h"
 #include "weight_store.h"
 #include <algorithm>
@@ -349,41 +350,67 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
     if (pos >= cfg_.max_ctx) { fprintf(stderr, "engine: pos %d >= max_ctx %d\n", pos, cfg_.max_ctx); abort(); }
     if (token_id < 0 || token_id >= VOCAB) { fprintf(stderr, "engine: token %d out of range\n", token_id); abort(); }
 
+    dprof_begin(DP_EMBED, s);
     k_embed_broadcast<<<(HIDDEN + 255) / 256, 256, 0, s>>>(streams_, (const __nv_bfloat16*)embed_, token_id);
+    dprof_end(DP_EMBED, s);
 
     for (int i = 0; i < cfg_.n_layer; ++i) {
         LayerW& l = L_[i];
 
         // ---- attention site ----
+        dprof_begin(DP_HC_PRE_ATTN, s);
         CU(cudaMemcpyAsync(resid_, streams_, (size_t)HC_MULT * HIDDEN * 4, cudaMemcpyDeviceToDevice, s));
         hc_compose(streams_, l.hc_attn, coll_, post_, comb_, hcws_, s);
+        dprof_end(DP_HC_PRE_ATTN, s);
+        dprof_begin(DP_NORM_ATTN, s);
         rmsnorm(normed_, coll_, l.ln_in, GEMV_BF16, HIDDEN, s);
-        if (l.kda)
+        dprof_end(DP_NORM_ATTN, s);
+        dprof_begin(DP_ATTN, s);
+        if (l.kda) {
+            dprof_begin(DP_KDA, s);
             kda_decode_step(normed_, l.kw,
                             kda_conv_ + (size_t)l.kda_slot * KDA_CONV_PER_LAYER,
                             kda_state_ + (size_t)l.kda_slot * KDA_STATE_PER_LAYER,
                             sub_, ws_kda_, s);
-        else {
+            dprof_end(DP_KDA, s);
+        } else {
+            dprof_begin(DP_MLA, s);
             IndexerState IS = idxState(l.mla_slot);
             mla_decode_step_dsa(normed_, l.mw, l.iw, IS,
                                 mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
                                 pos, cfg_.max_ctx, idx_sel_, idx_n_, sub_, ws_mla_, ws_idx_, s);
+            dprof_end(DP_MLA, s);
         }
+        dprof_end(DP_ATTN, s);
+        dprof_begin(DP_HC_POST_ATTN, s);
         hc_apply(streams_, resid_, sub_, post_, comb_, s);
+        dprof_end(DP_HC_POST_ATTN, s);
 
         // ---- MLP site ----
+        dprof_begin(DP_HC_PRE_FFN, s);
         CU(cudaMemcpyAsync(resid_, streams_, (size_t)HC_MULT * HIDDEN * 4, cudaMemcpyDeviceToDevice, s));
         hc_compose(streams_, l.hc_ffn, coll_, post_, comb_, hcws_, s);
+        dprof_end(DP_HC_PRE_FFN, s);
+        dprof_begin(DP_NORM_FFN, s);
         rmsnorm(normed_, coll_, l.ln_post, GEMV_BF16, HIDDEN, s);
-        if (l.moe) moe_forward(normed_, l.ml, sub_, sel_, selw_, ws_moe_, s);
-        else       dense_mlp(normed_, l.dense, sub_, ws_mlp_, s);
+        dprof_end(DP_NORM_FFN, s);
+        dprof_begin(DP_FFN, s);
+        if (l.moe) { dprof_begin(DP_MOE,   s); moe_forward(normed_, l.ml, sub_, sel_, selw_, ws_moe_, s); dprof_end(DP_MOE,   s); }
+        else       { dprof_begin(DP_DENSE, s); dense_mlp(normed_, l.dense, sub_, ws_mlp_, s);             dprof_end(DP_DENSE, s); }
+        dprof_end(DP_FFN, s);
+        dprof_begin(DP_HC_POST_FFN, s);
         hc_apply(streams_, resid_, sub_, post_, comb_, s);
+        dprof_end(DP_HC_POST_FFN, s);
     }
 
     if (!logits) return;                                    // stack gate stops here
+    dprof_begin(DP_HEAD_MEAN, s);
     hc_head_mean(streams_, pooled_, s);                     // unweighted mean over the 4 streams
     rmsnorm(pooled_, pooled_, final_norm_, GEMV_BF16, HIDDEN, s);
+    dprof_end(DP_HEAD_MEAN, s);
+    dprof_begin(DP_LM_HEAD, s);
     gemv(logits, lm_head_, pooled_, VOCAB, HIDDEN, GEMV_BF16, s);
+    dprof_end(DP_LM_HEAD, s);
 }
 
 // ---- prefill -----------------------------------------------------------------------------------

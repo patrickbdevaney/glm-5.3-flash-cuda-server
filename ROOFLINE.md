@@ -20,8 +20,8 @@ Regenerate with:
 | mla (dsa full-attn, 11 layers) | 2.82 G | 2.7% | 2.584 G | 13.1% |
 | lm_head | 1.27 G | 1.2% | 1.269 G | 6.4% |
 | moe shared expert | 0.61 G | 0.6% | 0.595 G | 3.0% |
-| dense mlp (layers 0–2) | 0.60 G | 0.6% | 0.604 G | 3.1% |
-| moe router | 0.35 G | 0.3% | 0.352 G | 1.8% |
+| dense mlp (layers 0–2) | 0.91 G | 0.9% | 0.906 G | 4.6% |
+| moe router | 0.05 G | 0.0% | 0.050 G | 0.3% |
 | dsa indexer | 0.18 G | 0.2% | 0.164 G | 0.8% |
 | hyper-connections | 0.07 G | 0.1% | 0.071 G | 0.4% |
 | embed / vision tower / mtp glue | 2.47 G | 2.4% | ~0 | 0% |
@@ -62,7 +62,13 @@ AR wall     12.14  -> 24.85 tok/s   @ 240 GB/s
 resident    98.15  -> 88.57 GiB     (Thor envelope ~117 GiB)
 ```
 
-**This single change is worth more than every kernel optimisation combined**, and it also buys
+**SUPERSEDED BY OPTIMIZATION_LOG #9 — measure before believing this.** The claim below assumed
+every phase converts bytes to time at the same rate. Profiled, they do not: the phases this
+lever targets (KDA, MLA, `lm_head`) already run at 72-86% of achievable bandwidth, while the
+MoE runs at 13% and owns 66.5% of the step. Applied first, this lever is worth **1.17x**;
+applied after the MoE kernels are fixed, 1.50x. Fix the MoE first.
+
+~~**This single change is worth more than every kernel optimisation combined**~~, and it also buys
 ~9.6 GiB of envelope headroom, which is what makes long context and a resident MTP block
 affordable. `gemma-cuda-server` cycle 22/23 measured the same lever on `lm_head` alone and got
 +6.9% then +26%.

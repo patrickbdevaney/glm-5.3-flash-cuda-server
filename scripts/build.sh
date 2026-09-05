@@ -4,7 +4,7 @@
 set -e; cd "$(dirname "$0")/.."
 mkdir -p build
 ARCH="-gencode arch=compute_110a,code=sm_110a"
-K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu kernels/indexer.cu"
+K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu kernels/indexer.cu kernels/dprof.cu"
 E="src/engine.cu $K"
 
 # CPU-only gates. These need no GPU and no checkpoint weights, so they run anywhere and are the
@@ -30,6 +30,7 @@ for t in bench_kda; do
 done
 nvcc -O2 -std=c++17 $ARCH -I include tools/bw_probe.cu -o build/bw_probe && echo "built build/bw_probe"
 nvcc -O2 -std=c++17 $ARCH -I include tools/bench_batch.cu $E -o build/bench_batch && echo "built build/bench_batch"
+nvcc -O2 -std=c++17 $ARCH -I include tools/bench_decode.cu $E -o build/bench_decode && echo "built build/bench_decode"
 
 # The server. -pthread for httplib's thread pool; the UI, API shaping and tokenizer are all headers.
 nvcc -O2 -std=c++17 $ARCH -I include -Xcompiler -pthread \

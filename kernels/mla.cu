@@ -18,6 +18,7 @@
 // and it is why only the 512-wide latent needs caching: 88 MiB at 8k context across all 11 layers,
 // against 1408 MiB for the expanded form.
 #include "mla.h"
+#include "dprof.h"
 #include "indexer.h"
 #include "gemv.h"
 #include "layer.h"
@@ -245,13 +246,17 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
     const int n_tok = t + 1;
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));   // 1/16
 
+    dprof_begin(DP_M_QPROJ, s);
     gemv(q_resid, W.q_a, x, MLA_Q_LORA, HIDDEN, W.dtype, s);
     rmsnorm(q_resid, q_resid, W.q_a_norm, W.dtype, MLA_Q_LORA, s);
     gemv(q, W.q_b, q_resid, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+    dprof_end(DP_M_QPROJ, s);
 
+    dprof_begin(DP_M_KV, s);
     gemv(c_new, W.kv_a, x, Lk, HIDDEN, W.dtype, s);
     rmsnorm(c_new, c_new, W.kv_a_norm, W.dtype, Lk, s);
     k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new, t);
+    dprof_end(DP_M_KV, s);
 
     k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
     constexpr int TT = 8;
@@ -336,12 +341,17 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     // Pool keys are built incrementally as each group of 4 tokens completes, so a run that only
     // started the indexer once the context crossed 2051 would have no pool keys for the first
     // 512 pools — which is most of the context, and exactly the part it then has to score.
+    dprof_begin(DP_M_INDEXER, s);
     indexer_keys(x, IW, IS, t, iws, s);
+    dprof_end(DP_M_INDEXER, s);
 
+    dprof_begin(DP_M_ABSORB, s);
     k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
+    dprof_end(DP_M_ABSORB, s);
     constexpr int TT = 8;
     constexpr int HG = 16;
 
+    dprof_begin(DP_M_SDPA, s);
     if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
         // Below the limit the indexer provably selects every visible key (ref/gen_indexer.py), so
         // scoring and selecting would burn a top-k over every pool to arrive at "all of them".
@@ -360,9 +370,12 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
         k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
         k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
     }
+    dprof_end(DP_M_SDPA, s);
 
+    dprof_begin(DP_M_OPROJ, s);
     k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
     gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
+    dprof_end(DP_M_OPROJ, s);
 }
 
 void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeights& IW,

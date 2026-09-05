@@ -103,6 +103,10 @@ public:
     double residentGiB() const;
     int    maxCtx() const { return cfg_.max_ctx; }
     int    nLayer()  const { return cfg_.n_layer; }
+    // The engine's own [max_batch, VOCAB] logits buffer. Exposed so a profiling driver can
+    // drive decode() without allocating a second one and changing the memory footprint it
+    // is trying to measure.
+    float* logitsDev() { return logits_dev_; }
     int    seqLen()  const { return (int)seq_.size(); }     // tokens currently in the resident state
 
 private:

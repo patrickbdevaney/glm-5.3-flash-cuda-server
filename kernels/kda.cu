@@ -15,6 +15,7 @@
 // Reference: transformers Glm5NextTextLinearAttention / recurrent_kimi_delta_attention.
 // Gated against it on real layer-0 weights by tests/gate_kda.cu.
 #include "kda.h"
+#include "dprof.h"
 #include "gemv.h"
 #include "glm5_config.h"
 #include <cstdio>
@@ -278,12 +279,12 @@ void kda_decode_step(const float* x, const KdaWeights& W, float* conv_state, flo
     float* core   = ws + 8 * Q + 256 + H;
     float* normed = ws + 9 * Q + 256 + H;
 
-    kda_qkv_conv(x, W, conv_state, qkv, ws, s);
-    kda_gates(x, W, g, beta, gate, f_area, s);
-    kda_norm_qk(qkv, q_n, k_n, s);
-    kda_recurrence(q_n, k_n, qkv + 2 * Q, g, beta, S, core, s);
-    kda_out_norm(core, gate, W.o_norm, W.dtype, normed, s);
-    gemv(y, W.o_proj, normed, HIDDEN, Q, W.dtype, s);
+    dprof_begin(DP_K_QKVCONV, s); kda_qkv_conv(x, W, conv_state, qkv, ws, s);            dprof_end(DP_K_QKVCONV, s);
+    dprof_begin(DP_K_GATES, s);   kda_gates(x, W, g, beta, gate, f_area, s);              dprof_end(DP_K_GATES, s);
+    dprof_begin(DP_K_NORMQK, s);  kda_norm_qk(qkv, q_n, k_n, s);                          dprof_end(DP_K_NORMQK, s);
+    dprof_begin(DP_K_RECUR, s);   kda_recurrence(q_n, k_n, qkv + 2 * Q, g, beta, S, core, s); dprof_end(DP_K_RECUR, s);
+    dprof_begin(DP_K_OUTNORM, s); kda_out_norm(core, gate, W.o_norm, W.dtype, normed, s);  dprof_end(DP_K_OUTNORM, s);
+    dprof_begin(DP_K_OPROJ, s);   gemv(y, W.o_proj, normed, HIDDEN, Q, W.dtype, s);        dprof_end(DP_K_OPROJ, s);
 }
 
 // ---- batched -----------------------------------------------------------------------------------

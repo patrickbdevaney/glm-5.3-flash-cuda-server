@@ -39,7 +39,13 @@ def classify(name):
         return 'moe routed experts'
     if body.startswith('mlp.shared_experts.'):
         return 'moe shared expert'
-    if body.startswith('mlp.gate'):
+    # The dot is load-bearing. `mlp.gate` also prefixes `mlp.gate_proj.weight`, which is the
+    # SwiGLU gate of the three DENSE MLPs -- a [12288, 4096] bf16, 0.302 G across the three, 6x
+    # the real router. Without the dot it lands in this bucket and inflates 'moe router' from
+    # 0.051 G to 0.352 G while under-reporting 'dense mlp' by the same amount. Caught by dprof:
+    # the router mark measured 313 GB/s against a machine that tops out at 247, and a phase
+    # cannot beat the memory system (OPTIMIZATION_LOG #9).
+    if body.startswith('mlp.gate.'):
         return 'moe router'
     if body.startswith('mlp.'):
         return 'dense mlp (first_k_dense_replace)'
