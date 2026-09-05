@@ -16,6 +16,9 @@ done
 for g in gate_kda gate_moe gate_layer gate_mla; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $K -o build/$g && echo "built build/$g"
 done
+# the indexer needs no engine and no checkpoint shards: its oracle dumps its own inputs
+nvcc -O2 -std=c++17 $ARCH -I include tests/gate_indexer.cu kernels/indexer.cu kernels/gemv.cu \
+     -o build/gate_indexer && echo "built build/gate_indexer"
 # gates that drive the whole engine
 for g in gate_stack gate_batch; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $E -o build/$g && echo "built build/$g"

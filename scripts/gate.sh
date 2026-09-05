@@ -10,7 +10,7 @@
 set -u; cd "$(dirname "$0")/.."
 rc=0
 CPU="gate_tokenizer gate_encoding gate_sample gate_stream gate_api"
-GPU="gate_kda gate_moe gate_layer gate_mla gate_stack gate_batch"
+GPU="gate_kda gate_moe gate_layer gate_mla gate_indexer gate_stack gate_batch"
 ONLY="${1:-all}"
 case "$ONLY" in cpu) LIST="$CPU";; gpu) LIST="$GPU";; *) LIST="$CPU $GPU";; esac
 for g in $LIST; do

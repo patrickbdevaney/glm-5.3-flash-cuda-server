@@ -74,6 +74,11 @@ constexpr int IDX_KPOOL         = 4;         // k-pooling with compress gate + A
 // = IDX_TOPK + IDX_KPOOL - 1, because the trailing incomplete pool is unselectable but its tokens
 // are appended raw. Verified against the real indexer in ref/gen_indexer.py: 2051 dense, 2052 not.
 constexpr int DENSE_CTX_LIMIT   = IDX_TOPK + IDX_KPOOL - 1;
+// The indexer's output is a CONSTANT width at every context length, padded with -1.
+constexpr int IDX_OUT_WIDTH     = IDX_TOPK + IDX_KPOOL - 1;
+constexpr int IDX_SELECT_MAX    = IDX_TOPK / IDX_KPOOL;      // 512 pools, the top-k budget
+// The indexer's k_norm is a LayerNorm (eps 1e-6), NOT the RMSNorm (RMS_EPS) used elsewhere.
+constexpr float IDX_LN_EPS      = 1e-6f;
 
 // ---- MoE ----
 constexpr int N_ROUTED_EXPERT   = 144;       // REAP-50 pruned from 288
