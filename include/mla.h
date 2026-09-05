@@ -2,6 +2,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "indexer.h"
 
 namespace glm5 {
 
@@ -41,5 +42,26 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
 // looks like fluent text.
 void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0, int M,
                     int max_ctx, float* y, float* ws, cudaStream_t s);
+
+// DSA decode: indexer + sparse attention. Required above DENSE_CTX_LIMIT; below it this is
+// bit-identical to mla_decode_step and exists only so that equivalence can be gated.
+// `sel` is [IDX_OUT_WIDTH] int32 and `nsel` one int, both device.
+//
+// `force_sparse` is a TEST-ONLY knob. Below DENSE_CTX_LIMIT this function takes the dense branch,
+// because the indexer provably selects everything there and scoring every pool to conclude that
+// would be wasted work. But that also means the sparse kernels are never exercised where a known
+// answer exists — so tests/gate_mla_sparse.cu forces them on and requires bit-identical output.
+// Without it the gate would be comparing the dense path against itself and passing vacuously.
+void mla_decode_step_dsa(const float* x, const MlaWeights& W, const struct IndexerWeights& IW,
+                         struct IndexerState& IS, float* cache, int t, int max_ctx,
+                         int32_t* sel, int32_t* nsel, float* y, float* ws, float* iws,
+                         cudaStream_t s, bool force_sparse = false);
+
+// Batched twin. Projections are batched as in mla_batch_step; the indexer and the attention run
+// per token inside the same loop, because both are inherently per-query.
+void mla_batch_step_dsa(const float* x, const MlaWeights& W, const struct IndexerWeights& IW,
+                        struct IndexerState& IS, float* cache, int pos0, int M, int max_ctx,
+                        int32_t* sel, int32_t* nsel, float* y, float* ws, float* iws,
+                        cudaStream_t s, bool force_sparse = false);
 
 }  // namespace glm5

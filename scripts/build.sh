@@ -4,7 +4,7 @@
 set -e; cd "$(dirname "$0")/.."
 mkdir -p build
 ARCH="-gencode arch=compute_110a,code=sm_110a"
-K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu"
+K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu kernels/indexer.cu"
 E="src/engine.cu $K"
 
 # CPU-only gates. These need no GPU and no checkpoint weights, so they run anywhere and are the
@@ -19,6 +19,8 @@ done
 # the indexer needs no engine and no checkpoint shards: its oracle dumps its own inputs
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_indexer.cu kernels/indexer.cu kernels/gemv.cu \
      -o build/gate_indexer && echo "built build/gate_indexer"
+nvcc -O2 -std=c++17 $ARCH -I include tests/gate_mla_sparse.cu $K \
+     -o build/gate_mla_sparse && echo "built build/gate_mla_sparse"
 # gates that drive the whole engine
 for g in gate_stack gate_batch; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $E -o build/$g && echo "built build/$g"

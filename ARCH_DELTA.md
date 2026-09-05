@@ -153,6 +153,11 @@ Three more facts a kernel will need, none of them guessable from the config:
   model. Reusing the model's own norm here would be wrong in a way that still produces plausible
   scores.
 
+**Built and gated 2026-09-04.** `kernels/indexer.cu` + the sparse MLA twin. Pool scores match the
+reference at cosine 1.000000000; the visible-key SET matches at all 5,091 query positions across
+T=38/2050/3003; sparse attention is BIT-IDENTICAL to dense for all 2051 in-limit steps and provably
+diverges above. The engine no longer has a context ceiling.
+
 Pool keys are a softmax-weighted average over each complete pool of
 (`index_kpool_compress_gate @ hidden` + `index_kpool_compress_ape`), so **they are fixed once a
 pool's 4 tokens exist** — the kernel should compute each pool key once on completion and cache it,

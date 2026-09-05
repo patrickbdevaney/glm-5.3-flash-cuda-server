@@ -235,11 +235,11 @@ void indexer_scores(const float* h, const float* q_resid, const IndexerWeights& 
                                              rsqrtf((float)HD));
 }
 
-void indexer_decode_step(const float* h, const float* q_resid, const IndexerWeights& W,
-                         IndexerState& S, int t, int max_ctx,
-                         int32_t* out_idx, int32_t* out_n, float* ws, cudaStream_t s) {
-    indexer_keys(h, W, S, t, ws, s);
-
+// Scoring and selection only. `indexer_keys` must already have run for this token (and for every
+// token before it) — the pool state is incremental.
+void indexer_select(const float* h, const float* q_resid, const IndexerWeights& W,
+                    IndexerState& S, int t, int32_t* out_idx, int32_t* out_n,
+                    float* ws, cudaStream_t s) {
     // Only COMPLETE pools are candidates; the count is floor((t+1)/kpool), which is exactly the
     // `keep = pool_valid.any(0)` trim the reference applies.
     const int n_pools  = (t + 1) / KP;
@@ -251,6 +251,13 @@ void indexer_decode_step(const float* h, const float* q_resid, const IndexerWeig
     static int32_t* sel = nullptr;                  // TOPK_RADIX_CAP ints, reused across calls
     if (!sel) CU(cudaMalloc(&sel, TOPK_RADIX_CAP * sizeof(int32_t)));
     k_select_emit<<<1, TOPK_RADIX_NT, 0, s>>>(out_idx, out_n, scores, sel, n_pools, select_k, t);
+}
+
+void indexer_decode_step(const float* h, const float* q_resid, const IndexerWeights& W,
+                         IndexerState& S, int t, int max_ctx,
+                         int32_t* out_idx, int32_t* out_n, float* ws, cudaStream_t s) {
+    indexer_keys(h, W, S, t, ws, s);
+    indexer_select(h, q_resid, W, S, t, out_idx, out_n, ws, s);
 }
 
 }  // namespace glm5

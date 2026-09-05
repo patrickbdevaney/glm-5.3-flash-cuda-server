@@ -18,6 +18,7 @@
 // and it is why only the 512-wide latent needs caching: 88 MiB at 8k context across all 11 layers,
 // against 1408 MiB for the expanded form.
 #include "mla.h"
+#include "indexer.h"
 #include "gemv.h"
 #include "layer.h"
 #include "glm5_config.h"
@@ -26,6 +27,9 @@
 #include <cstdint>
 
 namespace glm5 {
+
+#define CU(x) do { cudaError_t e_=(x); if(e_){ fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__, \
+    cudaGetErrorString(e_)); abort(); } } while(0)
 
 static constexpr int Hh = MLA_HEADS;      // 64
 static constexpr int Dq = MLA_QK_NOPE;    // 256
@@ -85,9 +89,87 @@ __global__ void k_scores(float* __restrict__ scores, const float* __restrict__ q
     }
 }
 
+// Sparse twin of k_scores: slot i attends key sel[i] instead of key i. `sel` is ASCENDING (see
+// k_select_emit), so the cache is still read front-to-back — the gather is sequential, not random.
+template <int TT>
+__global__ void k_scores_sel(float* __restrict__ scores, const float* __restrict__ qa,
+                             const float* __restrict__ cache, const int32_t* __restrict__ sel,
+                             const int32_t* __restrict__ n_ptr, int max_ctx, float scaling) {
+    __shared__ float Ct[TT][Lk];
+    // The count lives on the DEVICE and the grid is sized for the worst case. Reading it back to
+    // pick a launch size would mean a stream sync per full-attention layer per token — 11 pipeline
+    // stalls a step, to save blocks that exit in nanoseconds.
+    const int n_sel = *n_ptr;
+    const int i0 = blockIdx.x * TT;
+    if (i0 >= n_sel) return;
+    for (int i = threadIdx.x; i < TT * Lk; i += blockDim.x) {
+        const int tt = i / Lk, l = i - tt * Lk;
+        const int t = (i0 + tt < n_sel) ? sel[i0 + tt] : -1;
+        Ct[tt][l] = (t >= 0) ? cache[(size_t)t * Lk + l] : 0.f;
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (warp >= TT || i0 + warp >= n_sel) return;
+    for (int h = 0; h < Hh; ++h) {
+        float acc = 0.f;
+        for (int l = lane; l < Lk; l += 32) acc += qa[(size_t)h * Lk + l] * Ct[warp][l];
+        for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        if (lane == 0) scores[(size_t)h * max_ctx + i0 + warp] = acc * scaling;
+    }
+}
+
+// Sparse twin of k_context. Same head-group amplification; the only change is the gather.
+template <int HG>
+__global__ void k_context_sel(float* __restrict__ ctx, const float* __restrict__ s,
+                              const float* __restrict__ cache, const int32_t* __restrict__ sel,
+                              const int32_t* __restrict__ n_ptr, int max_ctx) {
+    const int n_sel = *n_ptr;
+    const int h0 = blockIdx.x * HG, l = threadIdx.x;
+    float acc[HG];
+    #pragma unroll
+    for (int i = 0; i < HG; ++i) acc[i] = 0.f;
+    for (int i = 0; i < n_sel; ++i) {
+        const int t = sel[i];
+        if (t < 0) continue;
+        const float c = cache[(size_t)t * Lk + l];
+        #pragma unroll
+        for (int j = 0; j < HG; ++j) acc[j] += s[(size_t)(h0 + j) * max_ctx + i] * c;
+    }
+    #pragma unroll
+    for (int i = 0; i < HG; ++i) ctx[(size_t)(h0 + i) * Lk + l] = acc[i];
+}
+
 // softmax over the n_tok visible positions, one block per head.
 template <int BS>
 __global__ void k_softmax(float* __restrict__ s, int n_tok, int max_ctx) {
+    const int h = blockIdx.x;
+    float* row = s + (size_t)h * max_ctx;
+    __shared__ float rm[BS / 32], rs[BS / 32];
+    float m = -1e30f;
+    for (int t = threadIdx.x; t < n_tok; t += BS) m = fmaxf(m, row[t]);
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+    if ((threadIdx.x & 31) == 0) rm[threadIdx.x >> 5] = m;
+    __syncthreads();
+    __shared__ float mx;
+    if (threadIdx.x == 0) { float v = -1e30f; for (int k = 0; k < BS / 32; ++k) v = fmaxf(v, rm[k]); mx = v; }
+    __syncthreads();
+    float sum = 0.f;
+    for (int t = threadIdx.x; t < n_tok; t += BS) { const float e = __expf(row[t] - mx); row[t] = e; sum += e; }
+    for (int o = 16; o; o >>= 1) sum += __shfl_down_sync(0xffffffff, sum, o);
+    if ((threadIdx.x & 31) == 0) rs[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    __shared__ float tot;
+    if (threadIdx.x == 0) { float v = 0; for (int k = 0; k < BS / 32; ++k) v += rs[k]; tot = v; }
+    __syncthreads();
+    for (int t = threadIdx.x; t < n_tok; t += BS) row[t] /= tot;
+}
+
+// Same softmax, count read from device memory. Duplicated rather than templated on a predicate so
+// the dense path keeps its compile-time bound and nothing about it changes.
+template <int BS>
+__global__ void k_softmax_dev(float* __restrict__ s, const int32_t* __restrict__ n_ptr, int max_ctx) {
+    const int n_tok = *n_ptr;
     const int h = blockIdx.x;
     float* row = s + (size_t)h * max_ctx;
     __shared__ float rm[BS / 32], rs[BS / 32];
@@ -215,6 +297,118 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
         constexpr int HG = 16;
         k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+        k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads + (size_t)m * Hh * Dv, ctx,
+                                                (const __nv_bfloat16*)W.kv_b);
+    }
+
+    gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);
+}
+
+// DSA decode: run the indexer, then attend only the keys it selected.
+//
+// Below DENSE_CTX_LIMIT this is a strictly redundant path — the indexer selects every visible key,
+// the ascending emit makes the accumulation order identical, and the result is BIT-IDENTICAL to
+// mla_decode_step. tests/gate_mla_sparse.cu asserts exactly that, which is the only end-to-end
+// check available for the sparse path: above the limit there is no dense answer to compare to.
+void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeights& IW,
+                         IndexerState& IS, float* cache, int t, int max_ctx,
+                         int32_t* sel, int32_t* nsel, float* y, float* ws, float* iws,
+                         cudaStream_t s, bool force_sparse) {
+    float* q_resid = ws;
+    float* q       = ws + MLA_Q_LORA;
+    float* c_new   = q + MLA_Q_DIM;
+    float* qa      = c_new + Lk;
+    float* scores  = qa + (size_t)Hh * Lk;
+    float* ctx     = scores + (size_t)Hh * max_ctx;
+    float* heads   = ctx + (size_t)Hh * Lk;
+    const int n_tok = t + 1;
+    const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
+
+    gemv(q_resid, W.q_a, x, MLA_Q_LORA, HIDDEN, W.dtype, s);
+    rmsnorm(q_resid, q_resid, W.q_a_norm, W.dtype, MLA_Q_LORA, s);
+    gemv(q, W.q_b, q_resid, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+
+    gemv(c_new, W.kv_a, x, Lk, HIDDEN, W.dtype, s);
+    rmsnorm(c_new, c_new, W.kv_a_norm, W.dtype, Lk, s);
+    k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new, t);
+
+    // THE POOL STATE MUST BE MAINTAINED FROM TOKEN 0, EVEN WHILE ATTENTION IS STILL DENSE.
+    // Pool keys are built incrementally as each group of 4 tokens completes, so a run that only
+    // started the indexer once the context crossed 2051 would have no pool keys for the first
+    // 512 pools — which is most of the context, and exactly the part it then has to score.
+    indexer_keys(x, IW, IS, t, iws, s);
+
+    k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
+    constexpr int TT = 8;
+    constexpr int HG = 16;
+
+    if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
+        // Below the limit the indexer provably selects every visible key (ref/gen_indexer.py), so
+        // scoring and selecting would burn a top-k over every pool to arrive at "all of them".
+        // Dense attention is the same answer for less work — bit-identically, which
+        // tests/gate_mla_sparse.cu asserts for all 2051 steps.
+        k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+        k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
+        k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+    } else {
+        // The indexer consumes the SAME q_resid the attention does — it is the q-side LoRA output,
+        // not a separate projection. Computing it twice would waste a gemv and give the two a way
+        // to drift apart.
+        indexer_select(x, q_resid, IW, IS, t, sel, nsel, iws, s);
+        constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;        // worst-case grid, count on device
+        k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa, cache, sel, nsel, max_ctx, scaling);
+        k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
+        k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
+    }
+
+    k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
+    gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
+}
+
+void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeights& IW,
+                        IndexerState& IS, float* cache, int pos0, int M, int max_ctx,
+                        int32_t* sel, int32_t* nsel, float* y, float* ws, float* iws,
+                        cudaStream_t s, bool force_sparse) {
+    float* q_resid = ws;
+    float* q       = q_resid + (size_t)M * MLA_Q_LORA;
+    float* c_new   = q + (size_t)M * MLA_Q_DIM;
+    float* heads   = c_new + (size_t)M * Lk;
+    float* qa      = heads + (size_t)M * Hh * Dv;
+    float* scores  = qa + (size_t)Hh * Lk;
+    float* ctx     = scores + (size_t)Hh * max_ctx;
+    const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
+
+    gemm(q_resid, W.q_a, x, M, MLA_Q_LORA, HIDDEN, W.dtype, s);
+    for (int m = 0; m < M; ++m)
+        rmsnorm(q_resid + (size_t)m * MLA_Q_LORA, q_resid + (size_t)m * MLA_Q_LORA,
+                W.q_a_norm, W.dtype, MLA_Q_LORA, s);
+    gemm(q, W.q_b, q_resid, M, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+
+    gemm(c_new, W.kv_a, x, M, Lk, HIDDEN, W.dtype, s);
+    for (int m = 0; m < M; ++m)
+        rmsnorm(c_new + (size_t)m * Lk, c_new + (size_t)m * Lk, W.kv_a_norm, W.dtype, Lk, s);
+    for (int m = 0; m < M; ++m)
+        k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new + (size_t)m * Lk, pos0 + m);
+
+    constexpr int TT = 8;
+    constexpr int HG = 16;
+    for (int m = 0; m < M; ++m) {
+        const int t = pos0 + m, n_tok = t + 1;
+        // Pool state is incremental and must advance for EVERY token, dense branch or not.
+        indexer_keys(x + (size_t)m * HIDDEN, IW, IS, t, iws, s);
+        k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q + (size_t)m * MLA_Q_DIM, (const __nv_bfloat16*)W.kv_b);
+        if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
+            k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+            k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
+            k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+        } else {
+            indexer_select(x + (size_t)m * HIDDEN, q_resid + (size_t)m * MLA_Q_LORA, IW, IS, t,
+                           sel, nsel, iws, s);
+            constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;
+            k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa, cache, sel, nsel, max_ctx, scaling);
+            k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
+            k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
+        }
         k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads + (size_t)m * Hh * Dv, ctx,
                                                 (const __nv_bfloat16*)W.kv_b);
     }

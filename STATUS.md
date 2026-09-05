@@ -20,7 +20,8 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **mHC + norms + dense MLP** | **gated cosine-1.0** — inside `tests/gate_layer.cu` |
 | **complete decoder layer 0** | **gated cosine-1.0**, 12/12 end-to-end — `tests/gate_layer.cu` |
 | **MLA full attention** (13.1%) | **gated cosine-1.0**, 4/4 — `tests/gate_mla.cu` |
-| DSA indexer (0.8%) | not started — **only needed above 2048 context** (verified) |
+| **DSA indexer** (0.8%) | **gated**, 15/15 vs the real module — `tests/gate_indexer.cu` |
+| **sparse MLA** | **gated bit-exact vs dense** for all 2051 in-limit steps — `tests/gate_mla_sparse.cu` |
 | **engine** (45 layers + lm_head) | **written and gated** — `tests/gate_stack.cu`, 4 decode steps cos 1.000000000 across 3 layers |
 | **multi-token forward** | **gated BIT-EXACT** vs the sequential path, 13/13 — `tests/gate_batch.cu`, at 4 layers so MLA and MoE run inside the engine loop |
 | **speculative rollback** | **gated** — accept 0/1/3/5 of a 5-wide snapshot then continue, all equal to a run that never speculated |
@@ -30,7 +31,8 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **HTTP server** | **running** — OpenAI chat + completions, SSE, tools, prefix reuse; 19/19 live smoke |
 | MTP + speculative decode | designed and costed, not built — `SPEC_DECODE.md` |
 
-**92.9% of per-token bandwidth is now implemented and gated against `transformers` on real
+**The context limit is gone.** A 4,073-token prompt now serves end to end; the engine ran dense
+below 2051 and switched to the indexer above it. **92.9% of per-token bandwidth is implemented and gated against `transformers` on real
 checkpoint weights.** Everything remaining on the AR path is `lm_head` (6.4%), which is a gemv
 that already exists and needs wiring, and the DSA indexer, which does not affect results below
 2048 tokens of context.
@@ -57,8 +59,6 @@ that already exists and needs wiring, and the DSA indexer, which does not affect
    full model and are blocked.
 4. **Resolve pre-norm vs post-norm for the MTP block's `h_prev`** before any head fine-tuning. Two
    lines, and getting it wrong would be baked into the fine-tune (`SPEC_DECODE.md`).
-5. **DSA indexer**, to go past 2048 context. k-pooling (`kpool` 4 + compress gate + APE) is new;
-   `index_topk` is 2048, not 512.
 6. **Batch the routed experts** — worth 4.7% at verify widths, 1.9x for wide prefill chunks. Do it
    for prefill, not for speculation.
 

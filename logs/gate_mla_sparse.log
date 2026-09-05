@@ -1,0 +1,9 @@
+=== gate_mla_sparse (layer 3, 3003 steps, dense limit 2051) ===
+loaded 14 tensors, 1.76 GiB
+  ok   sparse == dense BIT-EXACT for all 2051 steps at or below 2051
+  ok   key count is exactly right at every one of 3003 steps
+    above the limit: 0 of 952 steps still identical to dense
+  ok   sparse DIVERGES from dense above 2051 (indexer is doing work)
+--- 3 passed, 0 failed ---
+ALL SPARSE-MLA GATES PASS
+RC=0

@@ -36,14 +36,10 @@ static float* dalloc(std::vector<void*>& owned, size_t n_float, double* acc = nu
 }
 
 Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
-    // The dense-MLA limit is NOT index_topk. A trailing INCOMPLETE k-pool is never selectable
-    // (pool_valid needs all 4 tokens) but its tokens are appended raw by append_visible_tail, so a
-    // context of 2051 still has every token visible to every query. 2052 is the first length at
-    // which the indexer actually drops something. Measured against the real module in
-    // ref/gen_indexer.py, not derived from reading it.
-    if (cfg_.max_ctx > DENSE_CTX_LIMIT)
-        throw std::runtime_error("max_ctx > " + std::to_string(DENSE_CTX_LIMIT) +
-                                 " requires the DSA indexer, which is not implemented yet");
+    // No context limit any more. At or below DENSE_CTX_LIMIT (2051) the attention runs dense,
+    // which is EXACT because the indexer selects every visible key there; above it the indexer
+    // picks the top 512 pools and attention runs sparse over them. The pool state is maintained
+    // from token 0 either way, because it is built incrementally.
 
     // Load only what the requested layer count needs. On a box that cannot currently hold the
     // whole 98 GiB checkpoint this is the difference between a smoke test and an OOM.
@@ -111,6 +107,14 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
             l.mw.kv_a_norm = D("self_attn.kv_a_layernorm.weight");
             l.mw.kv_b      = D("self_attn.kv_b_proj.weight");
             l.mw.o_proj    = D("self_attn.o_proj.weight");
+            l.iw.dtype         = GEMV_BF16;
+            l.iw.wq_b          = D("self_attn.indexer.wq_b.weight");
+            l.iw.wk            = D("self_attn.indexer.wk.weight");
+            l.iw.k_norm_w      = D("self_attn.indexer.k_norm.weight");
+            l.iw.k_norm_b      = D("self_attn.indexer.k_norm.bias");
+            l.iw.weights_proj  = D("self_attn.indexer.weights_proj.weight");
+            l.iw.compress_ape  = D("self_attn.indexer.index_kpool_compress_ape");
+            l.iw.compress_gate = D("self_attn.indexer.index_kpool_compress_gate");
         }
 
         if (!l.moe) {
@@ -187,6 +191,10 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     kda_state_ = dalloc(owned_, (size_t)cfg_.state_slots * n_kda_ * KDA_STATE_PER_LAYER, &resident_);
     kda_conv_  = dalloc(owned_, (size_t)cfg_.state_slots * n_kda_ * KDA_CONV_PER_LAYER, &resident_);
     mla_cache_ = dalloc(owned_, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA, &resident_);
+    idx_state_ = dalloc(owned_, (size_t)n_full_ * indexer_state_floats(cfg_.max_ctx), &resident_);
+    ws_idx_    = dalloc(owned_, indexer_workspace_floats(cfg_.max_ctx));
+    { void* p; CU(cudaMalloc(&p, IDX_OUT_WIDTH * 4)); owned_.push_back(p); idx_sel_ = (int32_t*)p;
+      CU(cudaMalloc(&p, 4)); owned_.push_back(p); idx_n_ = (int32_t*)p; }
     if (cfg_.verbose)
         printf("engine: %d KDA layers (%.2f MiB state, context-independent), %d full-attn layers "
                "(%.2f MiB latent cache at %d ctx)\n",
@@ -206,6 +214,7 @@ void Engine::reset(cudaStream_t s) {
     CU(cudaMemsetAsync(kda_state_, 0, (size_t)cfg_.state_slots * n_kda_ * KDA_STATE_PER_LAYER * 4, s));
     CU(cudaMemsetAsync(kda_conv_, 0, (size_t)cfg_.state_slots * n_kda_ * KDA_CONV_PER_LAYER * 4, s));
     CU(cudaMemsetAsync(mla_cache_, 0, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA * 4, s));
+    CU(cudaMemsetAsync(idx_state_, 0, (size_t)n_full_ * indexer_state_floats(cfg_.max_ctx) * 4, s));
     seq_.clear();
 }
 
@@ -220,6 +229,16 @@ __global__ void k_embed_broadcast(float* __restrict__ streams, const __nv_bfloat
 }
 
 // M tokens, one forward. See engine.h for why this exists.
+// The per-layer view into the shared indexer state block.
+IndexerState Engine::idxState(int slot) {
+    IndexerState S{};
+    float* base = idx_state_ + (size_t)slot * indexer_state_floats(cfg_.max_ctx);
+    S.pool_keys = base;
+    S.roll_k    = base + (size_t)idx_max_pools(cfg_.max_ctx) * IDX_HEAD_DIM;
+    S.roll_gate = S.roll_k + IDX_KPOOL * IDX_HEAD_DIM;
+    return S;
+}
+
 void Engine::commit_state_slot(int j, cudaStream_t s) {
     if (j < 0 || j >= cfg_.state_slots) {
         fprintf(stderr, "engine: slot %d outside 0..%d\n", j, cfg_.state_slots - 1); abort(); }
@@ -275,10 +294,13 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
                            kda_state_ + (size_t)l.kda_slot * KDA_STATE_PER_LAYER,
                            snapshot ? (size_t)n_kda_ * KDA_STATE_PER_LAYER : 0,
                            b_sub_, b_ws_kda_, M, s);
-        else
-            mla_batch_step(b_normed_, l.mw,
-                           mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
-                           pos0, M, cfg_.max_ctx, b_sub_, b_ws_mla_, s);
+        else {
+            IndexerState IS = idxState(l.mla_slot);
+            mla_batch_step_dsa(b_normed_, l.mw, l.iw, IS,
+                               mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
+                               pos0, M, cfg_.max_ctx, idx_sel_, idx_n_, b_sub_, b_ws_mla_,
+                               ws_idx_, s);
+        }
         for (int m = 0; m < M; ++m)
             hc_apply(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_resid_ + (size_t)m * HC_MULT * HIDDEN,
                      b_sub_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
@@ -341,10 +363,12 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
                             kda_conv_ + (size_t)l.kda_slot * KDA_CONV_PER_LAYER,
                             kda_state_ + (size_t)l.kda_slot * KDA_STATE_PER_LAYER,
                             sub_, ws_kda_, s);
-        else
-            mla_decode_step(normed_, l.mw,
-                            mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
-                            pos, cfg_.max_ctx, sub_, ws_mla_, s);
+        else {
+            IndexerState IS = idxState(l.mla_slot);
+            mla_decode_step_dsa(normed_, l.mw, l.iw, IS,
+                                mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
+                                pos, cfg_.max_ctx, idx_sel_, idx_n_, sub_, ws_mla_, ws_idx_, s);
+        }
         hc_apply(streams_, resid_, sub_, post_, comb_, s);
 
         // ---- MLP site ----

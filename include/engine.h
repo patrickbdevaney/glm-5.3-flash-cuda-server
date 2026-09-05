@@ -9,6 +9,7 @@
 #include "sample.h"
 #include "kda.h"
 #include "mla.h"
+#include "indexer.h"
 #include "layer.h"
 #include "moe.h"
 
@@ -84,6 +85,7 @@ public:
 
     // Make slot j the canonical state. This is how a speculative verify accepts j of K drafts.
     void commit_state_slot(int j, cudaStream_t s = 0);
+    IndexerState idxState(int slot);
     int  stateSlots() const { return cfg_.state_slots; }
 
     // One decode step at position `pos` (0-based). Writes logits [VOCAB] fp32 to `logits`.
@@ -111,6 +113,7 @@ private:
         const void* ln_post = nullptr;
         KdaWeights  kw{};
         MlaWeights  mw{};
+        IndexerWeights iw{};
         DenseMlp    dense{};
         MoeLayer    ml{};
         int kda_slot = -1, mla_slot = -1;    // index into the state / cache arrays
@@ -159,6 +162,10 @@ private:
     float* kda_state_ = nullptr;  // [n_kda][64*128*128]
     float* kda_conv_  = nullptr;  // [n_kda][3*8192*3]
     float* mla_cache_ = nullptr;  // [n_full][max_ctx*512]
+    float* idx_state_ = nullptr;  // [n_full][indexer_state_floats(max_ctx)]
+    float* ws_idx_    = nullptr;
+    int32_t* idx_sel_ = nullptr;  // [IDX_OUT_WIDTH]
+    int32_t* idx_n_   = nullptr;
     int n_kda_ = 0, n_full_ = 0;
 
     // Host-side logits staging. Pinned, because at 620 KB per token an unpinned copy is a staged

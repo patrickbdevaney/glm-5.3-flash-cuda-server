@@ -68,6 +68,9 @@ void indexer_decode_step(const float* h, const float* q_resid, const IndexerWeig
 // Individually gateable stages, so a failure localises to one of them.
 void indexer_keys(const float* h, const IndexerWeights& W, IndexerState& S, int t,
                   float* ws, cudaStream_t s);                       // k, gate -> roll, maybe pool
+void indexer_select(const float* h, const float* q_resid, const IndexerWeights& W,
+                    IndexerState& S, int t, int32_t* out_idx, int32_t* out_n,
+                    float* ws, cudaStream_t s);
 void indexer_scores(const float* h, const float* q_resid, const IndexerWeights& W,
                     const IndexerState& S, int n_pools, float* scores, float* ws, cudaStream_t s);
 

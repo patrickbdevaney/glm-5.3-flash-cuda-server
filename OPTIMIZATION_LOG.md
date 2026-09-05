@@ -276,3 +276,60 @@ drops the predicted speculation win from 1.59x to 1.38x. It should be NVFP4, and
 system-level lossless — a draft error costs a rejection, not a wrong output — which brings it to
 1.49x. The largest single draft cost sits in the one place where reduced precision cannot hurt
 quality.
+
+---
+
+## #8 — The DSA indexer, and three gates that had to be rewritten because they were wrong
+
+The context ceiling is gone: the engine ran dense to 2051 and sparse above it, and a 4,073-token
+prompt now serves end to end where anything past 2048 used to be refused.
+
+**What the kernel had to get right, none of it guessable from the config.** `k_norm` is a LayerNorm
+*with a bias* (eps 1e-6), not the RMSNorm used everywhere else in this model. The pool softmax is
+per *channel* over the 4 tokens, not per token over the channels. A trailing incomplete pool is
+never selectable but its tokens are appended raw — which is why the dense limit is 2051 and not
+2048. And the head weights can be NEGATIVE, so `index_score` is a signed sum of relu terms that
+routinely produces `-0.0`; a top-k comparing raw bits would order that below `+0.0` and silently
+select different pools. The ported `topk_radix.h` already canonicalises it, which is most of why it
+was worth porting rather than writing.
+
+**Three times the gate reported a failure that was not one, and each taught something.**
+
+1. *The oracle ran bf16, the kernel arm runs fp32.* Pool scores differed in the third decimal, and
+   at lengths where the top-k actually excludes something the 512th-place pool flipped — 404 of
+   3003 rows, each off by exactly one pool. It looked like a logic bug and was a dtype mismatch in
+   the harness. bf16 weights widen to fp32 exactly, so an fp32 oracle uses identical weights with a
+   wider accumulator, and the disagreement vanished entirely.
+2. *Comparing the emitted ARRAY against the reference's array is not testable.* The oracle runs
+   prefill, so its `select_k` and slot offsets differ from decode's even when the visible-key SET
+   is identical. Attention consumes a set — it softmaxes over the selected keys — so the set is the
+   invariant and the array is an artefact of how the reference was captured.
+3. *Order cannot be compared on near-ties.* Our scores agree with the reference to 1.7e-6, and 2 of
+   the 511 adjacent gaps in the T=2050 ranking are TIGHTER than that — rank 412 to 413 is 5.1e-7.
+   Two correct fp32 implementations with different reduction orders swap that pair. The check
+   became "is every chosen pool at or above the select_k-th best score", which keeps every real
+   ordering bug and drops the artefact.
+
+**And once, the gate's own bug.** At T=38 it walked past the pool region into the raw tail and read
+a tail token as a pool id. The rule that keeps paying: when a gate fails, the gate is a suspect too.
+
+**Two design choices worth keeping.**
+
+- **The emit is sorted ASCENDING**, discarding the score order. Cache reads become sequential
+  instead of a gather — and, more usefully, the sparse path becomes bit-identical to the dense one
+  whenever the indexer selects everything, because the fp32 context sum then accumulates in the
+  same order. That converts "sparse agrees with dense below 2051" into an EXACT test needing no new
+  oracle, which is the only whole-path check available above the reference's reach.
+- **The selected count stays on the device.** Reading it back to size the launch would mean a
+  stream sync per full-attention layer per token — 11 pipeline stalls a step, to avoid launching
+  blocks that exit in nanoseconds.
+
+**One trap avoided by construction:** pool keys are built incrementally as each group of 4 tokens
+completes, so `indexer_keys` must run from token 0 **even while attention is still dense**. A
+version that started the indexer only once the context crossed 2051 would have no pool keys for the
+first 512 pools — which is most of the context it then has to score.
+
+**Below the limit the dense path is kept**, because the indexer provably selects everything there
+and scoring every pool to conclude "all of them" is wasted work. `force_sparse` exists purely so
+the gate can exercise the sparse kernels where a known answer exists; without it that gate would
+have been comparing dense against dense and passing vacuously — which it briefly did.
