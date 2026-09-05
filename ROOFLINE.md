@@ -62,11 +62,14 @@ AR wall     12.14  -> 24.85 tok/s   @ 240 GB/s
 resident    98.15  -> 88.57 GiB     (Thor envelope ~117 GiB)
 ```
 
-**SUPERSEDED BY OPTIMIZATION_LOG #9 — measure before believing this.** The claim below assumed
-every phase converts bytes to time at the same rate. Profiled, they do not: the phases this
-lever targets (KDA, MLA, `lm_head`) already run at 72-86% of achievable bandwidth, while the
-MoE runs at 13% and owns 66.5% of the step. Applied first, this lever is worth **1.17x**;
-applied after the MoE kernels are fixed, 1.50x. Fix the MoE first.
+**Ordering resolved; this is now the NEXT lever, and the only one left.** The claim below assumed
+every phase converts bytes to time at the same rate. Profiled, they did not: the phases this
+lever targets already ran at 72-86% of achievable bandwidth while the MoE ran at 13% and owned
+66.5% of the step, so applied first it was worth only 1.17x. **The MoE is now fixed
+(OPTIMIZATION_LOG #10, 2.12x on the step), and every phase this lever targets is at 190-200 GB/s,
+i.e. at the machine.** Kernel efficiency is at parity with the 0731 engine (67% vs 68% of
+achievable). From here `B_tok` is the only thing left to move, and this is how: estimated
+119.6 -> ~78 ms/step, **8.36 -> ~12.8 tok/s (~1.5x)**.
 
 ~~**This single change is worth more than every kernel optimisation combined**~~, and it also buys
 ~9.6 GiB of envelope headroom, which is what makes long context and a resident MTP block

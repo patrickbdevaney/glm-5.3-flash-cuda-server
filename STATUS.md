@@ -103,3 +103,20 @@ an analytic prediction rather than a measurement. See `CLAUDE.md` §6.
   (`ROOFLINE` §3) is worth more than any kernel work left on the table.
 - **Gate on real weights or do not bother.** Both "misaligned address" faults (`OPTIMIZATION_LOG`
   #2) were invisible to synthetic fixtures and fatal on the checkpoint.
+
+## Decode, after the MoE kernel rewrite (OPTIMIZATION_LOG #10)
+
+| | before | after | |
+|---|---|---|---|
+| AR decode, 45 layers, 512 ctx | 253.11 ms/step | **119.63 ms/step** | **2.12x** |
+| | 3.94 tok/s | **8.36 tok/s** | |
+| % of achievable bandwidth | 32% | **67%** | 0731 engine is at 68% |
+| `ffn:moe` | 4038 ms / 13% BW | **857 ms / 82% BW** | 4.71x |
+
+Every gate green throughout: `gate_kda` 15/15, `gate_moe` 3/3, `gate_layer` 12/12, `gate_mla` 4/4,
+`gate_indexer` 15/15, `gate_mla_sparse` 3/3, `gate_stack` 4/4, `gate_batch` 13/13.
+
+**Kernel efficiency is done.** Every remaining phase runs at 190-200 GB/s against a machine that
+streams 235-247. The only lever left is `B_tok` itself — ROOFLINE §3, the NVFP4 conversion of the
+13.32 GiB of bf16 dense weights, now correctly ordered *after* the MoE and worth ~1.5x
+(~12.8 tok/s). It is a checkpoint change, not a kernel change, and it has not been started.

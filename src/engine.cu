@@ -354,13 +354,19 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
     k_embed_broadcast<<<(HIDDEN + 255) / 256, 256, 0, s>>>(streams_, (const __nv_bfloat16*)embed_, token_id);
     dprof_end(DP_EMBED, s);
 
+    // PING-PONG, not a copy. hc_apply reads the pre-site streams as `residual` and writes the
+    // post-site streams, so the two never alias -- the memcpy that used to snapshot them into
+    // resid_ was moving 64 KB twice per layer, 5.9 MB and 90 launches per token, to produce a
+    // buffer the very next kernel could have read in place. 90 swaps is even, so `st` is back at
+    // streams_ by the end and streamsDev() still names the live buffer.
+    float* st = streams_, *alt = resid_;
+
     for (int i = 0; i < cfg_.n_layer; ++i) {
         LayerW& l = L_[i];
 
         // ---- attention site ----
         dprof_begin(DP_HC_PRE_ATTN, s);
-        CU(cudaMemcpyAsync(resid_, streams_, (size_t)HC_MULT * HIDDEN * 4, cudaMemcpyDeviceToDevice, s));
-        hc_compose(streams_, l.hc_attn, coll_, post_, comb_, hcws_, s);
+        hc_compose(st, l.hc_attn, coll_, post_, comb_, hcws_, s);
         dprof_end(DP_HC_PRE_ATTN, s);
         dprof_begin(DP_NORM_ATTN, s);
         rmsnorm(normed_, coll_, l.ln_in, GEMV_BF16, HIDDEN, s);
@@ -383,13 +389,13 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
         }
         dprof_end(DP_ATTN, s);
         dprof_begin(DP_HC_POST_ATTN, s);
-        hc_apply(streams_, resid_, sub_, post_, comb_, s);
+        hc_apply(alt, st, sub_, post_, comb_, s);
+        { float* t = st; st = alt; alt = t; }
         dprof_end(DP_HC_POST_ATTN, s);
 
         // ---- MLP site ----
         dprof_begin(DP_HC_PRE_FFN, s);
-        CU(cudaMemcpyAsync(resid_, streams_, (size_t)HC_MULT * HIDDEN * 4, cudaMemcpyDeviceToDevice, s));
-        hc_compose(streams_, l.hc_ffn, coll_, post_, comb_, hcws_, s);
+        hc_compose(st, l.hc_ffn, coll_, post_, comb_, hcws_, s);
         dprof_end(DP_HC_PRE_FFN, s);
         dprof_begin(DP_NORM_FFN, s);
         rmsnorm(normed_, coll_, l.ln_post, GEMV_BF16, HIDDEN, s);
@@ -399,13 +405,14 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
         else       { dprof_begin(DP_DENSE, s); dense_mlp(normed_, l.dense, sub_, ws_mlp_, s);             dprof_end(DP_DENSE, s); }
         dprof_end(DP_FFN, s);
         dprof_begin(DP_HC_POST_FFN, s);
-        hc_apply(streams_, resid_, sub_, post_, comb_, s);
+        hc_apply(alt, st, sub_, post_, comb_, s);
+        { float* t = st; st = alt; alt = t; }
         dprof_end(DP_HC_POST_FFN, s);
     }
 
     if (!logits) return;                                    // stack gate stops here
     dprof_begin(DP_HEAD_MEAN, s);
-    hc_head_mean(streams_, pooled_, s);                     // unweighted mean over the 4 streams
+    hc_head_mean(st, pooled_, s);                     // unweighted mean over the 4 streams
     rmsnorm(pooled_, pooled_, final_norm_, GEMV_BF16, HIDDEN, s);
     dprof_end(DP_HEAD_MEAN, s);
     dprof_begin(DP_LM_HEAD, s);

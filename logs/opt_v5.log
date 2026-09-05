@@ -1,0 +1,39 @@
+[dprof] enabled, 65536 marks
+engine: 57604 tensors, 98.15 GiB resident, 45 layers, max_ctx 512
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (11.00 MiB latent cache at 512 ctx)
+streaming read RIGHT NOW: 223.6 GB/s  (model resident; phases are priced against THIS)
+
+wall: 2875.40 ms for 24 steps = 119.81 ms/tok = 8.35 tok/s
+roofline at 223.6 GB/s with B_tok 19.761 G: 11.32 tok/s  ->  we are at 74%
+
+[dprof] AR decode — decode step by sub-op, summed over 24 step(s) and all layers
+[dprof] phase                        ms       %    calls     GB/tok     GB/s     %BW
+[dprof] hc:pre_attn               28.46    1.0%     1080      0.035     29.9     13%
+[dprof] norm:attn                  7.11    0.2%     1080          -        -       -
+[dprof] ATTENTION               1654.11   57.7%     1080     11.950    173.4     78%
+[dprof] hc:post_attn               5.29    0.2%     1080          -        -       -
+[dprof] hc:pre_ffn                27.05    0.9%     1080      0.035     31.5     14%
+[dprof] norm:ffn                   7.55    0.3%     1080          -        -       -
+[dprof] FFN                      978.92   34.2%     1080      6.307    154.6     69%
+[dprof] hc:post_ffn                5.60    0.2%     1080          -        -       -
+[dprof] embed                      0.18    0.0%       24          -        -       -
+[dprof] head:mean                  0.33    0.0%       24          -        -       -
+[dprof] lm_head                  150.01    5.2%       24      1.269    203.0     91%
+[dprof]   attn:kda              1237.03   43.2%      816      9.366    181.7     81%
+[dprof]   attn:mla               414.42   14.5%      264      2.584    149.6     67%
+[dprof]     kda:qkv+conv         818.15   28.6%      816      6.850    200.9     90%
+[dprof]     kda:gates             81.71    2.9%      816      0.500    146.9     66%
+[dprof]     kda:norm_qk            4.66    0.2%      816          -        -       -
+[dprof]     kda:recurrence        36.74    1.3%      816      0.305    199.2     89%
+[dprof]     kda:out_norm           5.24    0.2%      816          -        -       -
+[dprof]     kda:o_proj           282.68    9.9%      816      2.283    193.8     87%
+[dprof]     mla:indexer            8.96    0.3%      264          -        -       -
+[dprof]     mla:absorb_q          38.15    1.3%      264          -        -       -
+[dprof]     mla:sdpa              14.71    0.5%      264          -        -       -
+[dprof]     mla:o_proj           230.02    8.0%      264          -        -       -
+[dprof]   ffn:moe                864.22   30.2%     1008      5.401    150.0     67%
+[dprof]   ffn:dense              112.07    3.9%       72      0.906    194.0     87%
+[dprof]     moe:router            28.48    1.0%     1008      0.050     42.1     19%
+[dprof]     moe:w13+act          555.07   19.4%     1008      3.568    154.3     69%
+[dprof]     moe:w2+combine       275.40    9.6%     1008      1.783    155.4     69%
+[dprof] TOTAL                   2864.61  (119.36 ms/step, 8.38 tok/s)

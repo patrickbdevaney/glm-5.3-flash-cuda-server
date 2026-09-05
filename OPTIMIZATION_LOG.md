@@ -399,3 +399,78 @@ runs at 512 ctx. Those cells now print a dash rather than a number that would in
 
 `kda:gates` at 29% (167 ms) and the two `hc:` compose marks at 6% (119 ms combined) are together
 4.7% of the step — worth having, worth nothing before the MoE.
+
+---
+
+## #10 — The MoE kernels, fixed: 2.12x on the whole step
+
+#9 said the MoE owned 66.5% of the step while moving 27% of the bytes, and that fixing it was
+worth 2.29x. It was worth 1.94x on its own and 2.12x with the follow-on work.
+
+    253.11 ms/step  ->  119.63 ms/step        3.94  ->  8.36 tok/s
+    ffn:moe  4038 ms -> 857 ms  (4.71x)       13% -> 82% of achievable bandwidth
+
+Every change below is gated against the PyTorch oracle on real checkpoint weights, and
+`gate_batch` (forward_batch at M=1 must be bit-identical to decode) passes throughout.
+
+| # | change | why it was slow | gate | measured |
+|---|---|---|---|---|
+| a | **MoE: warp-per-row + HW FP4 unpack + ILP 4** | Three faces of "not enough bytes in flight". (1) Block-per-row: at BS=128 each thread ran TWO iterations, then paid a 5-step shuffle, a shared round trip and a `__syncthreads` — the reduction cost more than the work. (2) A `__constant__` LUT for the e2m1 nibble: constant memory broadcasts only on a uniform address, and every lane reads a different one, so all 16 lookups per group serialised up to 8 ways. (3) ILP=1. Replaced with warp-per-row (shuffle reduce only), `__nv_cvt_fp4x2_to_halfraw2`, and a 4-deep unroll issuing 8 loads before consuming any. `k_expert_down`'s serial 9-slot loop moved into the grid (9x the warps) with a fixed-order combine, so it stays deterministic. | `gate_moe` cos 1.000000000, max_rel 3.738e-06 (baseline 3.723e-06) | **ffn:moe 4038 -> 968 ms**, step 253.11 -> 130.16 |
+| b | **Stage the MoE activation in shared** | Each of the 8 warps re-read all of `x` from L1 for both its gate and its up row: 32 bytes of fp32 activation fetched per 4 bytes of weight. | unchanged, 3.738e-06 | ffn:moe 968 -> 846 ms, step -> 125.26 |
+| c | **`gemv`/`gemm` block size as a function of K** | Fixed BS=256 on the `[8192, 128]` KDA gate projections left 224 of 256 threads idle and the launch degenerated to latency. Now 32/64/256 by K, picked by the *same* rule in both so the batch invariant holds. | `gate_batch` 13/13 | **kda:gates 171 -> 80 ms (2.14x)** |
+| d | **Warp-parallel Sinkhorn + split `k_hc_mix`** | 20 iterations x 8 reductions walked serially on thread 0 of a single block while 255 lanes waited. Now 16 lanes hold the 4x4, rows reduce over `__shfl_xor` bits 0-1 and columns over bits 2-3. `k_hc_mix` went from MIX=24 blocks (one per SM) to 96, with bf16x2 loads. | `gate_layer` post 6.773e-08, comb 8.353e-08 | **hc:pre 119 -> 56 ms (2.12x)** |
+| e | **Ping-pong the hyper-connection streams** | `hc_apply` reads the pre-site streams and writes the post-site streams — they never alias, so the `cudaMemcpyAsync` snapshotting them into `resid_` was moving 64 KB twice per layer, 5.9 MB and 90 launches per token, to make a buffer the next kernel could have read in place. | `gate_stack` 4/4 | folded into (d) |
+
+### Three things that were tried and did NOT work
+
+Recorded so they are not retried. All three are cases where the obvious reasoning was right about
+the mechanism and wrong about which mechanism binds.
+
+1. **Inline `fp8e4m3()` instead of the shared scale LUT.** The LUT is indexed by the scale BYTE
+   VALUE, which is effectively random across a warp — a textbook shared bank conflict, once per 8
+   weights. Decoding arithmetically instead is six ALU ops and no memory. Measured:
+   **w13+act 535 -> 637 ms, a 19% regression.** This kernel is instruction-bound, not
+   shared-bandwidth-bound, so trading a conflicted LDS for eight more ALU ops is backwards. The
+   LUT stays.
+
+2. **half2 math in the MoE (`GLM5_MOE_HALF=1`, kept, default off).** Halves the instruction count
+   per 8 codes (the e2m1 unpack already *produces* a half2, so consuming it as one removes the
+   conversion) and halves the staged activation. The 0731 engine got **2.59x** from exactly this.
+   Here, measured round-robin against the fp32 path so a contention spike lands on both:
+
+   | | fp32 | half2 |
+   |---|---|---|
+   | run A | 8.33 tok/s | 8.17 |
+   | run B | 8.29 | 8.16 |
+
+   **Consistently ~1.6% slower**, and it is not the same function: `gate_moe` cos 0.999999913,
+   rms_rel 5.738e-04. Two reasons not to ship it: no win, and the 0731 engine's identical change
+   cost that engine its draft-head acceptance (3.12 -> 1.00 tokens/verify, its #9). We have an MTP
+   head at 72.3% acceptance never fine-tuned against a perturbed target. The flag stays so the
+   measurement is repeatable, not because it is a candidate.
+
+3. **4-deep ILP unroll in `gemv`.** Threaded `acc` through helpers so the addition order is
+   unchanged and the result stays bit-identical. **Measured neutral**: mla:o_proj 235.20 -> 235.82,
+   kda:qkv+conv 823.63 -> 823.29, lm_head 151.11 -> 152.39. The compiler was already pipelining
+   the rolled loop. Kept (it is free and bit-identical), but it is not a lever.
+
+### CUDA graphs are NOT a lever here, and the profile says so
+
+Worth capturing because it was the obvious next idea and cost nothing to rule out. Over 24 steps,
+**wall 2978.18 ms against a dprof kernel total of 2967.30 — a 0.4% gap.** The GPU is essentially
+never idle between launches, so there is no launch overhead for a graph to remove. The 0731 engine
+got 1.17x from a full-step graph; that engine had a different launch profile. Do not port it.
+
+### Where the remaining gap is
+
+    phase              ms      % step   GB/s   note
+    kda:qkv+conv     823.3     28.7%   199.7   at the machine
+    ffn:moe          857.3     29.9%   151.2   fixed; the residue is instruction-bound FP4
+    kda:o_proj       287.9     10.0%   190.3   at the machine
+    mla:o_proj       235.8      8.2%     -     at the machine
+    lm_head          152.4      5.3%   199.9   at the machine
+
+**Kernel efficiency is now at parity with the 0731 engine**: we run at 67% of achievable
+bandwidth, that engine at 68% (14.61 tok/s against its 21.42 roofline). The remaining absolute
+difference in tok/s is not kernel quality, it is `B_tok` — 19.761 G/token here against ~11.2 G
+there. No further kernel work moves it much; §3's lever does.

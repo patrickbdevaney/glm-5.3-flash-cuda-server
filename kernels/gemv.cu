@@ -23,6 +23,30 @@
 
 namespace glm5 {
 
+// One float4 of W folded into the accumulator, in EXACTLY the source order of the original
+// rolled loop. These exist so the 4-deep unroll below can issue four independent loads before
+// consuming any of them without perturbing a single addition: `acc` is threaded through, so the
+// sequence of `acc +=` operations is identical to the rolled version and the result is
+// bit-identical -- which matters because forward_batch at M=1 must equal decode (gate_batch).
+//
+// Why unroll at all: the rolled loop consumes each load immediately, which is ILP=1. The 0731
+// engine measured that pattern at 110-132 GB/s on this box against 224-237 GB/s at ILP>=2, and
+// dprof has mla:o_proj (a [4096, 16384] bf16, the single widest gemv in the model) at 150 GB/s
+// while its narrower neighbours reach 200.
+__device__ __forceinline__ float acc4_f32(float acc, float4 w, const float4 xx) {
+    acc += w.x * xx.x + w.y * xx.y + w.z * xx.z + w.w * xx.w;
+    return acc;
+}
+__device__ __forceinline__ float acc8_bf16(float acc, float4 raw, const float* __restrict__ xp) {
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float2 f = __bfloat1622float2(h[j]);
+        acc += f.x * xp[j * 2] + f.y * xp[j * 2 + 1];
+    }
+    return acc;
+}
+
 template <int BS>
 __global__ void k_gemv_f32(float* __restrict__ y, const float* __restrict__ W,
                            const float* __restrict__ x, int N, int K) {
@@ -32,10 +56,15 @@ __global__ void k_gemv_f32(float* __restrict__ y, const float* __restrict__ W,
     const float4* xv = reinterpret_cast<const float4*>(x);
     const int K4 = K >> 2;
     float acc = 0.f;
-    for (int i = threadIdx.x; i < K4; i += BS) {
-        float4 w = Wr[i], xx = xv[i];
-        acc += w.x * xx.x + w.y * xx.y + w.z * xx.z + w.w * xx.w;
+    int i = threadIdx.x;
+    for (; i + 3 * BS < K4; i += 4 * BS) {
+        const float4 w0 = Wr[i], w1 = Wr[i + BS], w2 = Wr[i + 2 * BS], w3 = Wr[i + 3 * BS];
+        acc = acc4_f32(acc, w0, xv[i]);
+        acc = acc4_f32(acc, w1, xv[i + BS]);
+        acc = acc4_f32(acc, w2, xv[i + 2 * BS]);
+        acc = acc4_f32(acc, w3, xv[i + 3 * BS]);
     }
+    for (; i < K4; i += BS) acc = acc4_f32(acc, Wr[i], xv[i]);
     // tail (K is a multiple of 4 for every shape in this model, but do not assume it)
     for (int i = (K4 << 2) + threadIdx.x; i < K; i += BS) acc += W[(size_t)n * K + i] * x[i];
 
@@ -61,16 +90,15 @@ __global__ void k_gemv_bf16(float* __restrict__ y, const __nv_bfloat16* __restri
     const float4* Wr = reinterpret_cast<const float4*>(W + (size_t)n * K);
     const int K8 = K >> 3;
     float acc = 0.f;
-    for (int i = threadIdx.x; i < K8; i += BS) {
-        float4 raw = Wr[i];
-        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
-        const float* xp = x + (i << 3);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            float2 f = __bfloat1622float2(h[j]);
-            acc += f.x * xp[j * 2] + f.y * xp[j * 2 + 1];
-        }
+    int i = threadIdx.x;
+    for (; i + 3 * BS < K8; i += 4 * BS) {
+        const float4 r0 = Wr[i], r1 = Wr[i + BS], r2 = Wr[i + 2 * BS], r3 = Wr[i + 3 * BS];
+        acc = acc8_bf16(acc, r0, x + ((size_t)i << 3));
+        acc = acc8_bf16(acc, r1, x + ((size_t)(i + BS) << 3));
+        acc = acc8_bf16(acc, r2, x + ((size_t)(i + 2 * BS) << 3));
+        acc = acc8_bf16(acc, r3, x + ((size_t)(i + 3 * BS) << 3));
     }
+    for (; i < K8; i += BS) acc = acc8_bf16(acc, Wr[i], x + ((size_t)i << 3));
     for (int i = (K8 << 3) + threadIdx.x; i < K; i += BS)
         acc += __bfloat162float(W[(size_t)n * K + i]) * x[i];
 
@@ -131,16 +159,36 @@ static inline bool vec16_ok(const void* p, int K, int elem_bytes) {
     return (((uintptr_t)p & 15) == 0) && ((((size_t)K * elem_bytes) & 15) == 0);
 }
 
+// Block size as a function of K. A fixed 256 leaves most of a block idle on the short shapes:
+// the KDA gate projections are [8192, 128], where a 256-thread block gave 224 of its threads
+// nothing to do and the launch degenerated to pure latency (dprof measured kda:gates at 37% of
+// achievable while the gemvs on either side of it ran at 85%).
+//
+// gemv and gemm MUST agree on this for a given K. The reduction tree's shape is BS/32, so a
+// disagreement would silently break the invariant that forward_batch at M=1 is bit-identical to
+// decode -- which gate_batch asserts and speculative verification depends on.
+static inline int gemv_bs(int K) { return K <= 128 ? 32 : K <= 512 ? 64 : 256; }
+
+#define GEMV_LAUNCH(BS)                                                                          \
+    do {                                                                                         \
+        if (dtype == GEMV_F32) {                                                                 \
+            if (vec16_ok(W, K, 4)) k_gemv_f32<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K); \
+            else k_gemv_f32_scalar<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K);            \
+        } else {                                                                                 \
+            if (vec16_ok(W, K, 2))                                                               \
+                k_gemv_bf16<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);            \
+            else k_gemv_bf16_scalar<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);    \
+        }                                                                                        \
+    } while (0)
+
 void gemv(float* y, const void* W, const float* x, int N, int K, int dtype, cudaStream_t s) {
-    constexpr int BS = 256;
-    if (dtype == GEMV_F32) {
-        if (vec16_ok(W, K, 4)) k_gemv_f32<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K);
-        else                   k_gemv_f32_scalar<BS><<<N, BS, 0, s>>>(y, (const float*)W, x, N, K);
-    } else {
-        if (vec16_ok(W, K, 2)) k_gemv_bf16<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);
-        else                   k_gemv_bf16_scalar<BS><<<N, BS, 0, s>>>(y, (const __nv_bfloat16*)W, x, N, K);
+    switch (gemv_bs(K)) {
+        case 32:  GEMV_LAUNCH(32);  break;
+        case 64:  GEMV_LAUNCH(64);  break;
+        default:  GEMV_LAUNCH(256); break;
     }
 }
+#undef GEMV_LAUNCH
 
 }  // namespace glm5
 
@@ -323,7 +371,7 @@ __global__ void k_gemm_bf16_scalar(float* __restrict__ y, const __nv_bfloat16* _
     }
 }
 
-#define GEMM_LAUNCH(MB)                                                                       \
+#define GEMM_LAUNCH_BS(BS, MB)                                                                       \
     do {                                                                                      \
         if (dtype == GEMV_F32) {                                                              \
             if (vok) k_gemm_f32<BS, MB><<<N, BS, 0, s>>>(yc, (const float*)W, xc, N, K);       \
@@ -334,8 +382,17 @@ __global__ void k_gemm_bf16_scalar(float* __restrict__ y, const __nv_bfloat16* _
         }                                                                                     \
     } while (0)
 
+// Mirrors gemv_bs(K) exactly -- see the note there on why they must not diverge.
+#define GEMM_LAUNCH(MB)                                    \
+    do {                                                   \
+        switch (gemv_bs(K)) {                              \
+            case 32:  GEMM_LAUNCH_BS(32,  MB); break;      \
+            case 64:  GEMM_LAUNCH_BS(64,  MB); break;      \
+            default:  GEMM_LAUNCH_BS(256, MB); break;      \
+        }                                                  \
+    } while (0)
+
 void gemm(float* y, const void* W, const float* x, int M, int N, int K, int dtype, cudaStream_t s) {
-    constexpr int BS = 256;
     const bool vok = vec16_ok(W, K, dtype == GEMV_F32 ? 4 : 2);
     int done = 0;
     while (done < M) {
@@ -361,5 +418,6 @@ void gemm(float* y, const void* W, const float* x, int M, int N, int K, int dtyp
     }
 }
 #undef GEMM_LAUNCH
+#undef GEMM_LAUNCH_BS
 
 }  // namespace glm5

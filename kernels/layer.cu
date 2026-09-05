@@ -22,7 +22,9 @@ static constexpr int HC = HC_MULT;        // 4
 static constexpr int MIX = HC_MIX;        // 24
 static constexpr int HCD = HC_HCD;        // 16384
 
-size_t hc_workspace_floats() { return MIX; }
+// pdot[MIX*SPLIT] + psq[MIX*SPLIT]
+static constexpr int HC_SPLIT = 4;
+size_t hc_workspace_floats() { return 2 * (size_t)MIX * HC_SPLIT; }
 size_t dense_mlp_workspace_floats() { return 2 * (size_t)DENSE_INTER; }
 size_t dense_mlp_batch_workspace_floats(int B) { return 2 * (size_t)B * DENSE_INTER; }
 
@@ -32,16 +34,32 @@ size_t dense_mlp_batch_workspace_floats(int B) { return 2 * (size_t)B * DENSE_IN
 // block already streams all of `streams` for its own dot product, so accumulating sum(x^2) from
 // the same registers costs one extra FMA per element and zero extra loads, and removes a
 // cross-block dependency from a phase that is almost entirely latency.
-template <int BS>
-__global__ void k_hc_mix(float* __restrict__ mix, const float* __restrict__ streams,
-                         const __nv_bfloat16* __restrict__ fn, float eps) {
-    const int m = blockIdx.x;
-    const __nv_bfloat16* fr = fn + (size_t)m * HCD;
+// mix[m] = sum_j (streams[j] * rsqrt(mean(streams^2) + eps)) * fn[m][j]
+//
+// The rsqrt is recomputed independently in every block rather than being a separate kernel: each
+// block already streams all of `streams` for its own dot product, so accumulating sum(x^2) from
+// the same registers costs one extra FMA per element and zero extra loads, and removes a
+// cross-block dependency from a phase that is almost entirely latency.
+//
+// SPLIT: the first version launched MIX=24 blocks, which is roughly one per SM on this box and
+// leaves the machine idle in a phase dprof measured at 8% of achievable bandwidth. Each row is
+// now split SPLIT ways into partials that k_hc_gates reduces; the reduction is 24x4 floats and
+// costs nothing. Loads are bf16x2 / float2 rather than scalar -- fn comes from the checkpoint and
+// is only 4-byte aligned, so a bfloat162 (4 B) is the widest legal load, not a float4.
+template <int BS, int SPLIT>
+__global__ void k_hc_mix(float* __restrict__ pdot, float* __restrict__ psq,
+                         const float* __restrict__ streams,
+                         const __nv_bfloat16* __restrict__ fn) {
+    const int m = blockIdx.x, sp = blockIdx.y;
+    const int chunk = HCD / SPLIT, j0 = sp * chunk;
+    const __nv_bfloat162* fr = reinterpret_cast<const __nv_bfloat162*>(fn + (size_t)m * HCD + j0);
+    const float2* sv = reinterpret_cast<const float2*>(streams + j0);
     float dot = 0.f, sq = 0.f;
-    for (int j = threadIdx.x; j < HCD; j += BS) {
-        const float v = streams[j];
-        dot += v * __bfloat162float(fr[j]);
-        sq  += v * v;
+    for (int j = threadIdx.x; j < (chunk >> 1); j += BS) {
+        const float2 v = sv[j];
+        const float2 f = __bfloat1622float2(fr[j]);
+        dot = fmaf(v.x, f.x, dot); dot = fmaf(v.y, f.y, dot);
+        sq  = fmaf(v.x, v.x, sq);  sq  = fmaf(v.y, v.y, sq);
     }
     __shared__ float rd[BS / 32], rs[BS / 32];
     for (int o = 16; o; o >>= 1) { dot += __shfl_down_sync(0xffffffff, dot, o);
@@ -50,53 +68,73 @@ __global__ void k_hc_mix(float* __restrict__ mix, const float* __restrict__ stre
     if (lane == 0) { rd[warp] = dot; rs[warp] = sq; }
     __syncthreads();
     if (threadIdx.x == 0) {
-        float d = 0, s = 0;
-        for (int w = 0; w < BS / 32; ++w) { d += rd[w]; s += rs[w]; }
-        mix[m] = d * rsqrtf(s / (float)HCD + eps);
+        float d = 0, q = 0;
+        for (int w = 0; w < BS / 32; ++w) { d += rd[w]; q += rs[w]; }
+        pdot[m * SPLIT + sp] = d;
+        psq [m * SPLIT + sp] = q;
     }
 }
 
 // pre / post / comb, then Sinkhorn-Knopp onto the doubly-stochastic manifold.
-// 4x4 and 20 iterations: one thread, because the alternative is 40 block syncs to save ~600 flops.
+//
+// The 4x4 Sinkhorn runs on ONE WARP, sixteen lanes holding one matrix element each. The first
+// version ran all 20 iterations on thread 0 of a single block -- 20 x (4 row sums + 4 column
+// sums) walked serially by one lane while 255 others waited, and it dominated a phase that moves
+// only 35 MB per token. Row i lives in lanes 4i..4i+3 and column j in lanes j, j+4, j+8, j+12, so
+// a row reduction is __shfl_xor over bits 0-1 and a column reduction over bits 2-3. Lanes 16-31
+// take part in the shuffles (they must, for convergence) and their values are discarded; no mask
+// smaller than the full warp is correct here.
+//
+// Only block 0 writes post/comb. Every block computes `pre` for itself -- four sigmoids -- which
+// is what lets the collapse loop run on a real grid instead of the single block the serial
+// Sinkhorn used to force. Two blocks writing identical values to post/comb would be benign in
+// practice and invisible in a gate, which is exactly why it is not left in.
 __global__ void k_hc_gates(float* __restrict__ collapsed, float* __restrict__ post,
-                           float* __restrict__ comb, const float* __restrict__ mix,
+                           float* __restrict__ comb, const float* __restrict__ pdot,
+                           const float* __restrict__ psq,
                            const float* __restrict__ base, const float* __restrict__ scale,
-                           const float* __restrict__ streams, int iters, float eps) {
+                           const float* __restrict__ streams, int split, int iters, float eps) {
+    __shared__ float mix[MIX];
     __shared__ float pre[HC];
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < MIX) {
+        float d = 0.f, q = 0.f;
+        for (int sp = 0; sp < split; ++sp) { d += pdot[threadIdx.x * split + sp];
+                                             q += psq [threadIdx.x * split + sp]; }
+        mix[threadIdx.x] = d * rsqrtf(q / (float)HCD + RMS_EPS);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        const int t = threadIdx.x;
+        const unsigned FULL = 0xffffffffu;
         const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
-        for (int h = 0; h < HC; ++h) {
-            pre[h]  = 1.f / (1.f + __expf(-(mix[h] * s0 + base[h]))) + eps;
-            post[h] = 2.f / (1.f + __expf(-(mix[HC + h] * s1 + base[HC + h])));
+        if (t < HC) {
+            pre[t] = 1.f / (1.f + __expf(-(mix[t] * s0 + base[t]))) + eps;
+            if (blockIdx.x == 0)
+                post[t] = 2.f / (1.f + __expf(-(mix[HC + t] * s1 + base[HC + t])));
         }
         // comb: softmax over the last dim, then + eps, then alternating column/row normalisation.
-        float c[HC * HC];
-        for (int i = 0; i < HC; ++i) {
-            float mx = -1e30f;
-            for (int j = 0; j < HC; ++j) {
-                c[i * HC + j] = mix[2 * HC + i * HC + j] * s2 + base[2 * HC + i * HC + j];
-                mx = fmaxf(mx, c[i * HC + j]);
-            }
-            float sum = 0.f;
-            for (int j = 0; j < HC; ++j) { c[i * HC + j] = __expf(c[i * HC + j] - mx); sum += c[i * HC + j]; }
-            for (int j = 0; j < HC; ++j) c[i * HC + j] = c[i * HC + j] / sum + eps;
-        }
+        float c = (t < HC * HC) ? (mix[2 * HC + t] * s2 + base[2 * HC + t]) : -1e30f;
+        float mx = c;
+        mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, 2));
+        float e = __expf(c - mx);
+        float sum = e;
+        sum += __shfl_xor_sync(FULL, sum, 1);
+        sum += __shfl_xor_sync(FULL, sum, 2);
+        c = e / sum + eps;
         // reference does ONE column normalisation, then (iters-1) x (row, column)
-        for (int j = 0; j < HC; ++j) {
-            float s = eps; for (int i = 0; i < HC; ++i) s += c[i * HC + j];
-            for (int i = 0; i < HC; ++i) c[i * HC + j] /= s;
+        {
+            float q = c; q += __shfl_xor_sync(FULL, q, 4); q += __shfl_xor_sync(FULL, q, 8);
+            c /= (q + eps);
         }
         for (int it = 0; it < iters - 1; ++it) {
-            for (int i = 0; i < HC; ++i) {
-                float s = eps; for (int j = 0; j < HC; ++j) s += c[i * HC + j];
-                for (int j = 0; j < HC; ++j) c[i * HC + j] /= s;
-            }
-            for (int j = 0; j < HC; ++j) {
-                float s = eps; for (int i = 0; i < HC; ++i) s += c[i * HC + j];
-                for (int i = 0; i < HC; ++i) c[i * HC + j] /= s;
-            }
+            float r = c; r += __shfl_xor_sync(FULL, r, 1); r += __shfl_xor_sync(FULL, r, 2);
+            c /= (r + eps);
+            float q = c; q += __shfl_xor_sync(FULL, q, 4); q += __shfl_xor_sync(FULL, q, 8);
+            c /= (q + eps);
         }
-        for (int i = 0; i < HC * HC; ++i) comb[i] = c[i];
+        if (blockIdx.x == 0 && t < HC * HC) comb[t] = c;
     }
     __syncthreads();
     // collapsed[d] = sum_h pre[h] * streams[h][d]
@@ -172,13 +210,12 @@ __global__ void k_swiglu_clamped(float* __restrict__ out, const float* __restric
 // ---- entry points ------------------------------------------------------------------------------
 void hc_compose(const float* streams, const HcWeights& W, float* collapsed, float* post,
                 float* comb, float* ws, cudaStream_t s) {
-    k_hc_mix<256><<<MIX, 256, 0, s>>>(ws, streams, (const __nv_bfloat16*)W.fn, RMS_EPS);
-    // ONE block: the gate/Sinkhorn section runs on thread 0, so a multi-block launch would have
-    // every block redundantly redo the Sinkhorn and race to write identical post/comb. Identical
-    // values make it benign in practice and invisible in a gate, which is exactly why it is not
-    // left in. The collapse loop is grid-stride, so one block still covers all 4096 lanes.
-    k_hc_gates<<<1, 256, 0, s>>>(collapsed, post, comb, ws, W.base, W.scale, streams,
-                                 HC_SINKHORN_ITERS, HC_EPS);
+    k_hc_mix<128, HC_SPLIT><<<dim3(MIX, HC_SPLIT), 128, 0, s>>>(
+        ws, ws + MIX * HC_SPLIT, streams, (const __nv_bfloat16*)W.fn);
+    // 16 blocks: block 0 owns post/comb, every block computes `pre` for its own slice of the
+    // collapse. See the note on the kernel for why this is not a race.
+    k_hc_gates<<<16, 256, 0, s>>>(collapsed, post, comb, ws, ws + MIX * HC_SPLIT,
+                                  W.base, W.scale, streams, HC_SPLIT, HC_SINKHORN_ITERS, HC_EPS);
 }
 
 void hc_apply(float* streams, const float* residual, const float* sub, const float* post,
