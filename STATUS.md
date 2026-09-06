@@ -146,8 +146,13 @@ weight — 2 bytes of x per byte of bf16 weight, but 7.1 per byte of NVFP4. That
    ~~The next laggard is `attn:mla`.~~ **ALSO DONE** — OPTIMIZATION_LOG #13 (sub-phase marks) and
    #14 (batching `absorb_q`/`expand_v`, which each streamed the whole of `kv_b` per token).
    `attn:mla` is 20.0% -> 15.3% of prefill at 38% -> 54% of achievable bandwidth; prefill at
-   chunk 32 is **47.79 ms/tok**. The remaining MLA mass is `mla:sdpa`, which is CACHE traffic,
-   not weight traffic — a different problem from every lever in the log so far.
+   chunk 32 is **47.79 ms/tok**. The remaining MLA mass was `mla:sdpa` — ~~cache traffic~~
+   **also DONE**, OPTIMIZATION_LOG #15: it was `k_context` at 4 blocks, and the fix was occupancy,
+   not traffic (the latent cache is L2-resident, so its re-reads are nearly free). `sdpa:context`
+   5.22x, `mla:sdpa` 17.0% -> 7.4% of prefill at 2048-token prompts.
+   **`attn:mla` is no longer the laggard.** The largest remaining prefill rows are `ffn:moe`
+   (priced over 100% of bandwidth — a known byte-model error, it counts M x 8 expert reads rather
+   than the distinct count) and `attn:kda`.
 2. **The NVFP4 accuracy decision.** cos 0.9972 over three KDA layers against the PyTorch oracle;
    uniform rel 0.088-0.100 per tensor, no family worse than another. Reverting a family is a
    re-run of `tools/requant_dense_nvfp4.py --families`; `GLM5_DENSE_NVFP4=0` reverts all of it
