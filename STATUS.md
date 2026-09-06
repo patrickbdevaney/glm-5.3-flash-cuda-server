@@ -127,7 +127,7 @@ streams 235-247. The only lever left is `B_tok` itself — ROOFLINE §3, the NVF
 |---|---|---|---|
 | AR decode, 45 layers | 119.63 ms/step | **84.32 ms/step** | **1.42x** |
 | | 8.36 tok/s | **11.86 tok/s** | |
-| prefill @ chunk 16 | 84.0 ms/tok | **61.2 ms/tok** | **1.37x** |
+| prefill @ chunk 32 | 84.0 ms/tok | **51.7 ms/tok** | **1.63x** |
 | `B_tok` | 19.761 G | **9.762 G** | -50.6% |
 | resident | 98.15 GiB | 101.85 GiB | overlay is additive; the bf16 copies stay loaded |
 
@@ -141,11 +141,11 @@ weight — 2 bytes of x per byte of bf16 weight, but 7.1 per byte of NVFP4. That
 
 ### What is left, in order
 
-1. **Expert-gathering in the MoE.** `ffn:moe` is 48% of prefill and still pays full price per
-   token: making the token a grid dimension bought occupancy, not bytes, because 86 distinct
-   experts is ~400 MB per layer and nothing like an L2 working set. One block per distinct
-   expert, looping over its token list with the weight row in registers, is worth ~1.4x more on
-   prefill at width 32. It is a new kernel.
+1. ~~**Expert-gathering in the MoE.**~~ **DONE** — OPTIMIZATION_LOG #12. Prefill now falls with
+   width (57.5 / 52.8 / 51.7 / 51.5 at chunk 4 / 16 / 32 / 64) instead of rising, and the default
+   chunk is 32. The next laggard is **`attn:mla`**: 23.8% of prefill at 35% of achievable
+   bandwidth, and its sub-phase dprof marks do not exist in the batch path, so attributing it
+   needs those marks added first.
 2. **The NVFP4 accuracy decision.** cos 0.9972 over three KDA layers against the PyTorch oracle;
    uniform rel 0.088-0.100 per tensor, no family worse than another. Reverting a family is a
    re-run of `tools/requant_dense_nvfp4.py --families`; `GLM5_DENSE_NVFP4=0` reverts all of it
