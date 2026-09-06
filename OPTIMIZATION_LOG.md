@@ -607,3 +607,74 @@ was outside any kernel. It was not: `moe_forward` records 3 mark pairs per token
 a 256-token prefill at width 16 wants ~130k events and the 65536 default captured 41% of them.
 The giveaway was `lm_head` at 27224% of bandwidth. An impossible row is never a fast kernel — and
 here it was not even a wrong byte count, it was a truncated recording.
+
+---
+
+## #12 — Expert gathering: prefill 84.0 -> 51.5 ms/tok
+
+#11 made the token a grid dimension and got 5%. It could not get more, and the reason says what
+this had to be: **a grid dimension does not change how many times a weight is READ.** M tokens x 8
+slots is M*8 reads of an expert triple whether they run together or in sequence. At M=16 about 42
+of those 128 selections are repeats, and they were not served from cache — 86 distinct experts is
+~400 MB per layer, nothing like an L2 working set.
+
+So the repeats are collapsed in the kernel. `k_build_work` (one block, ~1 KB of shared) counts the
+pairs routed to each expert, lays them out contiguously, and emits one work item per
+(distinct expert, tile of TT=4 pairs). `k_expert_act_gathered` and `k_expert_down_gathered` then
+give one block to one work item: it reads that expert's rows **once** and applies them to every
+token in the tile.
+
+Expected reads fall from `M*8` to roughly `144*(1-(1-8/144)^M)`:
+
+| M | 4 | 16 | 32 | 64 |
+|---|---|---|---|---|
+| unbatched reads | 32 | 128 | 256 | 512 |
+| distinct experts | 27 | 86 | 121 | 140 |
+
+### Two things the shape had to respect
+
+**K is tiled, not fully staged.** The old kernel staged all of `x` in shared and indexed it by
+absolute k. The gathered one holds TT tokens, so it tiles K at 1024 — chosen to land exactly on
+the unrolled loop's 1024-element step, so the accumulation sequence is the same
+`base = 0, 1024, 2048, ...` it always was. 16 KB of shared, unchanged occupancy.
+
+**The accumulators are compile-time indexed.** `for (t = 0; t < TT; ++t) if (t < nt)` rather than
+`t < nt`, because a runtime-indexed accumulator array spills to local memory and the kernel stops
+being bandwidth-bound, which is the entire point of it.
+
+**The grid is sized for the worst case**, since `n_work` is a device value and a host-side grid
+cannot see it. Two bounds, tighter wins: every item holds at least one pair, and separately
+`sum_e ceil(cnt_e/TT) <= M*KS/TT + distinct`. At M=128 that is 432 blocks rather than 1152.
+
+### Bit-identity is structural, not lucky
+
+Every (token, slot) dot product is independent, so grouping changes which block computes it, never
+the value or the order of its accumulation. The pair order *within* a group comes from an atomic
+and is therefore arbitrary — which is fine precisely because each pair writes its own slot of
+`act` and `part`, and `k_down_combine` still sums the slots in a fixed order with no atomics.
+
+`gate_batch` checks it the only way worth checking: 12 sequential decodes as reference, then
+K = 1, 2, 3, 4, 5, 8 and ragged widths must match **bit for bit**. 13/13.
+
+M=1 stays on the ungathered path. There is nothing to collapse at M=1, and it keeps decode on
+exactly the kernels it was gated on.
+
+### Result
+
+| chunk | 4 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| ms/tok before #12 | 61.3 | 61.2 | 61.8 | — | — |
+| ms/tok after | 57.5 | 52.8 | **51.7** | 51.5 | 52.1 |
+
+Prefill now *falls* with width instead of rising, which is what a batched path was always supposed
+to do. The default chunk is 32: past that it stops improving and only costs buffers.
+
+**84.0 -> 51.5 ms/tok end to end, 1.63x**, decode unchanged at 11.60-11.86 tok/s.
+
+### What is now the laggard
+
+`attn:mla` is 23.8% of prefill at 35% of achievable bandwidth — it has become the worst phase by
+efficiency, and its sub-phase marks do not exist in the batch path, so attributing it needs those
+marks first. `ffn:moe` is 38.4% and its byte model now over-reports (the row reads >100%) because
+`kBytes` still prices M*8 expert reads rather than the distinct count; that row is a wrong byte
+count, in the direction that means the gathering is working.

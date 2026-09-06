@@ -23,7 +23,9 @@ struct EngineConfig {
     int  n_layer    = N_LAYER;
     // Widest multi-token forward the engine will run: the prefill chunk, and the ceiling on
     // speculative verify width. Sizes the batch activation buffers, so it must be set before load.
-    int  max_batch  = 16;
+    // 32 is where prefill stops improving: 57.5 / 52.8 / 51.7 / 51.5 / 52.1 ms/tok at chunk
+    // 4 / 16 / 32 / 64 / 128 (OPTIMIZATION_LOG #12). Wider costs buffers for nothing.
+    int  max_batch  = 32;
     // Recurrent-state slots. 1 = ordinary autoregression, updated in place, no extra memory.
     // Speculation needs draft_width+1: token m of a verify writes slot m+1, so slot j holds the
     // state after exactly j tokens and rejecting K-j drafts is a pointer move rather than an

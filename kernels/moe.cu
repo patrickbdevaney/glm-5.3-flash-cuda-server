@@ -326,6 +326,254 @@ __global__ void k_expert_down(float* __restrict__ part, const float* __restrict_
     if (lane == 0) part[(size_t)slot * hid + h] = acc;
 }
 
+// ---- expert gathering ---------------------------------------------------------------------
+//
+// Making the token a grid dimension (blockIdx.z) let the M tokens of a prefill chunk run
+// concurrently, and that was worth 5%. It could not be worth more, because it does not change
+// how many times a weight is READ: M tokens x 8 slots is M*8 reads of an expert triple whether
+// they run together or in sequence. At M=16 about 42 of those 128 selections are repeats, and
+// they were not being served from cache -- 86 distinct experts is ~400 MB per layer, nothing
+// like an L2 working set.
+//
+// So the repeats have to be collapsed in the KERNEL. One block owns one DISTINCT expert and a
+// tile of the (token, slot) pairs routed to it; it reads that expert's rows once and applies
+// them to every token in the tile. Expected reads fall from M*8 to
+// 144*(1-(1-8/144)^M) + ceil overheads: 128 -> ~90 at M=16, 256 -> ~130 at M=32.
+//
+// Bit-identity is preserved and is not an accident: every (token, slot) dot product is
+// independent, so grouping changes which block computes it, never the value or the order of the
+// accumulation. The pair order within a group comes from an atomic and is therefore arbitrary --
+// which is fine precisely because each pair writes its own slot of `act` and `part`, and
+// k_down_combine still sums the slots in fixed order.
+//
+// The K dimension is TILED (KT=1024) rather than staging all of x, because the shared buffer now
+// holds TT tokens instead of one. The tile boundary is chosen to land exactly on the unrolled
+// loop's 1024-element step, so the accumulation sequence is the same base = 0, 1024, 2048, ...
+// the ungathered kernel used.
+static constexpr int KT = 1024;                  // K-tile, one unrolled step of the inner loop
+static constexpr int TT = 4;                     // (token, slot) pairs per work item
+
+// One block. Counts how many pairs each expert got, lays them out contiguously, and emits one
+// work item per (expert, tile of TT pairs). The shared expert goes first and covers every token,
+// so it is always present and the routed groups follow it.
+__global__ void k_build_work(const int32_t* __restrict__ sel, int M, int E,
+                             int32_t* __restrict__ n_work, int32_t* __restrict__ w_eid,
+                             int32_t* __restrict__ w_start, int32_t* __restrict__ w_n,
+                             int32_t* __restrict__ p_tok, int32_t* __restrict__ p_slot) {
+    extern __shared__ int32_t sm_w[];
+    int32_t* cnt = sm_w;                         // [E] pairs routed to expert e
+    int32_t* cur = sm_w + E;                     // [E] write cursor into the pair list
+    for (int i = threadIdx.x; i < E; i += blockDim.x) cnt[i] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < M * KS; i += (int)blockDim.x) atomicAdd(&cnt[sel[i]], 1);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int p = 0, w = 0;
+        for (int t0 = 0; t0 < M; t0 += TT) {     // the shared expert: every token, slot KS
+            w_eid[w] = -1; w_start[w] = t0; w_n[w] = min(TT, M - t0); ++w;
+        }
+        for (int t = 0; t < M; ++t) { p_tok[t] = t; p_slot[t] = KS; }
+        p = M;
+        for (int e = 0; e < E; ++e) {
+            cur[e] = p;
+            if (!cnt[e]) continue;
+            for (int t0 = 0; t0 < cnt[e]; t0 += TT) {
+                w_eid[w] = e; w_start[w] = p + t0; w_n[w] = min(TT, cnt[e] - t0); ++w;
+            }
+            p += cnt[e];
+        }
+        *n_work = w;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < M * KS; i += (int)blockDim.x) {
+        const int q = atomicAdd(&cur[sel[i]], 1);
+        p_tok[q] = i / KS;
+        p_slot[q] = i - (i / KS) * KS;
+    }
+}
+
+template <int WPB>
+__global__ void k_expert_act_gathered(float* __restrict__ act, const float* __restrict__ x,
+                                      const Nvfp4Mat* __restrict__ experts,
+                                      const Nvfp4Mat* __restrict__ shared,
+                                      const int32_t* __restrict__ n_work,
+                                      const int32_t* __restrict__ w_eid,
+                                      const int32_t* __restrict__ w_start,
+                                      const int32_t* __restrict__ w_n,
+                                      const int32_t* __restrict__ p_tok,
+                                      const int32_t* __restrict__ p_slot,
+                                      int inter, int hid, float limit) {
+    const int a = blockIdx.y;
+    if (a >= *n_work) return;                    // the grid is sized for the worst case
+
+    __shared__ float lut[256];
+    extern __shared__ __align__(16) char smem_ag[];
+    float* xs = reinterpret_cast<float*>(smem_ag);           // [TT][KT]
+    for (int i = threadIdx.x; i < 256; i += WPB * 32) lut[i] = fp8e4m3((uint8_t)i);
+
+    const int st = w_start[a], nt = w_n[a], eid = w_eid[a];
+    const int32_t* __restrict__ tk = p_tok + st;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int o = blockIdx.x * WPB + warp;
+    const bool live = (o < inter);
+
+    const Nvfp4Mat* Mt = (eid < 0) ? shared : (experts + (size_t)eid * 3);
+    const uint8_t *Pg = nullptr, *Sg = nullptr, *Pu = nullptr, *Su = nullptr;
+    float igg = 0.f, igu = 0.f;
+    if (live) {
+        Pg = Mt[0].packed + (size_t)o * (hid >> 1);
+        Sg = Mt[0].scale  + (size_t)o * (hid >> 4);
+        Pu = Mt[1].packed + (size_t)o * (hid >> 1);
+        Su = Mt[1].scale  + (size_t)o * (hid >> 4);
+        igg = 1.f / Mt[0].gscale[0]; igu = 1.f / Mt[1].gscale[0];
+    }
+    // Compile-time indices only: a runtime-indexed accumulator array spills to local memory and
+    // the kernel stops being bandwidth-bound, which is the whole point of it.
+    float ag[TT], au[TT];
+    #pragma unroll
+    for (int t = 0; t < TT; ++t) { ag[t] = 0.f; au[t] = 0.f; }
+
+    for (int kt = 0; kt < hid; kt += KT) {
+        const int tn = min(KT, hid - kt);
+        for (int t = 0; t < nt; ++t) {
+            const float4* src = reinterpret_cast<const float4*>(x + (size_t)tk[t] * hid + kt);
+            float4* dst = reinterpret_cast<float4*>(xs + t * KT);
+            for (int i = threadIdx.x; i < (tn >> 2); i += WPB * 32) dst[i] = src[i];
+        }
+        __syncthreads();
+        if (live) {
+            const int K4 = tn & ~1023;
+            int base = 0;
+            for (; base < K4; base += 1024) {
+                int k[4]; unsigned pg[4], pu[4];
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    k[u] = base + (u << 8) + (lane << 3);
+                    pg[u] = __ldcs((const unsigned*)(Pg + ((kt + k[u]) >> 1)));
+                    pu[u] = __ldcs((const unsigned*)(Pu + ((kt + k[u]) >> 1)));
+                }
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float sg = lut[Sg[(kt + k[u]) >> 4]] * igg;
+                    const float su = lut[Su[(kt + k[u]) >> 4]] * igu;
+                    #pragma unroll
+                    for (int t = 0; t < TT; ++t) if (t < nt) {
+                        ag[t] = fmaf(dot8(xs + t * KT + k[u], pg[u]), sg, ag[t]);
+                        au[t] = fmaf(dot8(xs + t * KT + k[u], pu[u]), su, au[t]);
+                    }
+                }
+            }
+            for (; base < tn; base += 256) {
+                const int k0 = base + (lane << 3);
+                const unsigned wg = __ldcs((const unsigned*)(Pg + ((kt + k0) >> 1)));
+                const unsigned wu = __ldcs((const unsigned*)(Pu + ((kt + k0) >> 1)));
+                const float sg = lut[Sg[(kt + k0) >> 4]] * igg;
+                const float su = lut[Su[(kt + k0) >> 4]] * igu;
+                #pragma unroll
+                for (int t = 0; t < TT; ++t) if (t < nt) {
+                    ag[t] = fmaf(dot8(xs + t * KT + k0, wg), sg, ag[t]);
+                    au[t] = fmaf(dot8(xs + t * KT + k0, wu), su, au[t]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    #pragma unroll
+    for (int t = 0; t < TT; ++t) if (t < nt) {
+        float g = warp_sum(ag[t]), u = warp_sum(au[t]);
+        if (lane == 0) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+            act[((size_t)tk[t] * NS + p_slot[st + t]) * inter + o] = (g / (1.f + __expf(-g))) * u;
+        }
+    }
+}
+
+template <int WPB>
+__global__ void k_expert_down_gathered(float* __restrict__ part, const float* __restrict__ act,
+                                       const Nvfp4Mat* __restrict__ experts,
+                                       const Nvfp4Mat* __restrict__ shared,
+                                       const int32_t* __restrict__ n_work,
+                                       const int32_t* __restrict__ w_eid,
+                                       const int32_t* __restrict__ w_start,
+                                       const int32_t* __restrict__ w_n,
+                                       const int32_t* __restrict__ p_tok,
+                                       const int32_t* __restrict__ p_slot,
+                                       int inter, int hid) {
+    const int a = blockIdx.y;
+    if (a >= *n_work) return;
+
+    __shared__ float lut[256];
+    extern __shared__ __align__(16) char smem_dg[];
+    float* as = reinterpret_cast<float*>(smem_dg);           // [TT][KT] of the activation
+    for (int i = threadIdx.x; i < 256; i += WPB * 32) lut[i] = fp8e4m3((uint8_t)i);
+
+    const int st = w_start[a], nt = w_n[a], eid = w_eid[a];
+    const int32_t* __restrict__ tk = p_tok + st;
+    const int32_t* __restrict__ sl = p_slot + st;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int h = blockIdx.x * WPB + warp;
+    const bool live = (h < hid);
+
+    const Nvfp4Mat* Mt = (eid < 0) ? shared : (experts + (size_t)eid * 3);
+    const uint8_t *P = nullptr, *S = nullptr; float ig = 0.f;
+    if (live) {
+        P  = Mt[2].packed + (size_t)h * (inter >> 1);
+        S  = Mt[2].scale  + (size_t)h * (inter >> 4);
+        ig = 1.f / Mt[2].gscale[0];
+    }
+    float acc[TT];
+    #pragma unroll
+    for (int t = 0; t < TT; ++t) acc[t] = 0.f;
+
+    for (int kt = 0; kt < inter; kt += KT) {
+        const int tn = min(KT, inter - kt);
+        for (int t = 0; t < nt; ++t) {
+            const float4* src = reinterpret_cast<const float4*>(
+                act + ((size_t)tk[t] * NS + sl[t]) * inter + kt);
+            float4* dst = reinterpret_cast<float4*>(as + t * KT);
+            for (int i = threadIdx.x; i < (tn >> 2); i += WPB * 32) dst[i] = src[i];
+        }
+        __syncthreads();
+        if (live) {
+            const int K4 = tn & ~1023;
+            int base = 0;
+            for (; base < K4; base += 1024) {
+                int k[4]; unsigned pv[4];
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    k[u] = base + (u << 8) + (lane << 3);
+                    pv[u] = __ldcs((const unsigned*)(P + ((kt + k[u]) >> 1)));
+                }
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float sc = lut[S[(kt + k[u]) >> 4]] * ig;
+                    #pragma unroll
+                    for (int t = 0; t < TT; ++t) if (t < nt)
+                        acc[t] = fmaf(dot8(as + t * KT + k[u], pv[u]), sc, acc[t]);
+                }
+            }
+            for (; base < tn; base += 256) {
+                const int k0 = base + (lane << 3);
+                const unsigned wv = __ldcs((const unsigned*)(P + ((kt + k0) >> 1)));
+                const float sc = lut[S[(kt + k0) >> 4]] * ig;
+                #pragma unroll
+                for (int t = 0; t < TT; ++t) if (t < nt)
+                    acc[t] = fmaf(dot8(as + t * KT + k0, wv), sc, acc[t]);
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    #pragma unroll
+    for (int t = 0; t < TT; ++t) if (t < nt) {
+        const float r = warp_sum(acc[t]);
+        if (lane == 0) part[((size_t)tk[t] * NS + sl[t]) * hid + h] = r;
+    }
+}
+
 // Fixed slot order, no atomics: bit-identical across runs.
 __global__ void k_down_combine(float* __restrict__ y, const float* __restrict__ part,
                                const float* __restrict__ wts, int hid) {
@@ -346,8 +594,28 @@ __global__ void k_down_combine(float* __restrict__ y, const float* __restrict__ 
 // logits[E] + act[NS*I] + part[NS*H]. The `part` buffer is the price of splitting the down_proj
 // slot loop into the grid; at 147 KB it is noise next to the 5.4 GB/tok this block streams.
 size_t moe_workspace_floats() { return moe_batch_workspace_floats(1); }
+
+// Pairs (token, slot) that the gathering step has to place: M*KS routed plus M shared. Work items
+// can never exceed that, since every item holds at least one pair.
+static inline size_t moe_pairs(int M) { return (size_t)M * (KS + 1); }
+
+// Worst-case work items, which is what the grid has to be sized for since n_work is a device
+// value. Two bounds and the tighter one wins: every item holds at least one pair, and separately
+// sum_e ceil(cnt_e / TT) <= M*KS/TT + (distinct experts), with the shared expert adding
+// ceil(M/TT). The second bound is what keeps a wide chunk from launching mostly-empty blocks --
+// at M=128 it is 432 rather than 1152.
+static inline size_t moe_max_work(int M) {
+    const size_t pairs = moe_pairs(M);
+    const size_t distinct = (size_t)N_ROUTED_EXPERT < (size_t)M * KS ? (size_t)N_ROUTED_EXPERT
+                                                                     : (size_t)M * KS;
+    const size_t bound = (size_t)M * KS / TT + distinct + ((size_t)M + TT - 1) / TT;
+    return bound < pairs ? bound : pairs;
+}
+
 size_t moe_batch_workspace_floats(int M) {
-    return (size_t)M * ((size_t)N_ROUTED_EXPERT + (size_t)NS * I + (size_t)NS * H);
+    const size_t base = (size_t)M * ((size_t)N_ROUTED_EXPERT + (size_t)NS * I + (size_t)NS * H);
+    // n_work, then w_eid/w_start/w_n and p_tok/p_slot, as int32 in the float workspace's tail.
+    return base + 1 + 5 * moe_pairs(M);
 }
 
 // Fail loudly at load time rather than with a misaligned-address fault mid-request.
@@ -394,6 +662,35 @@ void moe_forward_batch(const float* x, const MoeLayer& L, float* y, int32_t* sel
     dprof_begin(DP_E_ROUTER, s);
     moe_route_batch(x, L, sel, wts, logits, M, s);
     dprof_end(DP_E_ROUTER, s);
+
+    // M > 1: collapse the repeated expert selections so each DISTINCT expert is read once. At
+    // M = 1 there is nothing to collapse, so decode stays on the path it was gated on.
+    if (M > 1 && !HALF) {
+        const size_t P = moe_pairs(M), W = moe_max_work(M);
+        int32_t* gi = reinterpret_cast<int32_t*>(part + (size_t)M * NS * H);
+        int32_t* n_work = gi;
+        int32_t* w_eid  = gi + 1;
+        int32_t* w_start = w_eid + P;
+        int32_t* w_n     = w_start + P;
+        int32_t* p_tok   = w_n + P;
+        int32_t* p_slot  = p_tok + P;
+        k_build_work<<<1, 256, 2 * L.n_expert * sizeof(int32_t), s>>>(
+            sel, M, L.n_expert, n_work, w_eid, w_start, w_n, p_tok, p_slot);
+        dprof_begin(DP_E_ACT, s);
+        k_expert_act_gathered<WPB><<<dim3((I + WPB - 1) / WPB, (unsigned)W), WPB * 32,
+                                     TT * KT * sizeof(float), s>>>(
+            act, x, L.experts, L.shared, n_work, w_eid, w_start, w_n, p_tok, p_slot,
+            I, H, SWIGLU_LIMIT);
+        dprof_end(DP_E_ACT, s);
+        dprof_begin(DP_E_DOWN, s);
+        k_expert_down_gathered<WPB><<<dim3((H + WPB - 1) / WPB, (unsigned)W), WPB * 32,
+                                      TT * KT * sizeof(float), s>>>(
+            part, act, L.experts, L.shared, n_work, w_eid, w_start, w_n, p_tok, p_slot, I, H);
+        k_down_combine<<<dim3((H + 255) / 256, M), 256, 0, s>>>(y, part, wts, H);
+        dprof_end(DP_E_DOWN, s);
+        return;
+    }
+
     dprof_begin(DP_E_ACT, s);
     if (HALF)
         k_expert_act<WPB, true><<<dim3((I + WPB - 1) / WPB, NS, M), WPB * 32, H * sizeof(__half), s>>>(
