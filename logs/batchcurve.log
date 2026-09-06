@@ -1,0 +1,23 @@
+=== bench_batch (45 layers) ===
+engine: dense NVFP4 overlay ACTIVE
+engine: 58840 tensors, 101.85 GiB resident, 45 layers, max_ctx 512
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (11.00 MiB latent cache at 512 ctx)
+streaming read RIGHT NOW: 180.0 GB/s  (idle-box reference is 240; anything well below
+  that means the box is contended and the absolute numbers here are depressed --
+  the RATIOS between widths are what this bench is for)
+
+   K     min ms     med ms    ms/token     vs K=1   speedup
+   1      77.30      86.05      77.305      1.000     1.00x
+   2     178.28     186.46      89.139      2.306     0.87x
+   3     182.10     188.16      60.699      2.356     1.27x
+   4     217.67     224.68      54.416      2.816     1.42x
+   5     282.65     291.80      56.531      3.656     1.37x
+   6     372.43     384.37      62.072      4.818     1.25x
+   8     410.82     423.35      51.353      5.314     1.51x
+  12     604.77     617.84      50.397      7.823     1.53x
+  16     789.42     805.31      49.339     10.212     1.57x
+
+'vs K=1' is what ROOFLINE.md §4 predicts as the cost column; 'speedup' is the
+ceiling a verify of that width could reach if every drafted token were accepted.
+If min and med differ by more than ~15%, the box was contended and this run is not a
+measurement — repeat it when the GPU is idle.

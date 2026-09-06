@@ -954,3 +954,69 @@ is still a bug in the count. Rows over 100% are flagged `!` rather than left to 
 
 Two build consequences: `gemv.cu` now references dprof, so `gate_indexer` and `gate_nvfp4` link
 `kernels/dprof.cu` (they failed to link before this was noticed).
+
+---
+
+## 17. Gate 0 for the draft head: speculation cannot win on this architecture
+
+The DFlash/MTP draft head was the stated goal. It is **blocked, and not by the head** — the same
+verdict as the GGUF path reached, but for a different and more fundamental reason.
+
+### The batch curve (45 layers, idle box, streaming probe 220.8 GB/s, min/med within 3%)
+
+| K | min ms | vs K=1 | ceiling if every draft accepted |
+|---|---|---|---|
+| 1 | 84.22 | 1.000 | 1.00x |
+| 2 | 182.23 | 2.164 | 0.92x |
+| 3 | 185.12 | 2.198 | 1.36x |
+| 4 | 222.00 | 2.636 | 1.52x |
+| 8 | 419.16 | 4.977 | 1.61x |
+| 16 | 798.19 | 9.477 | 1.69x |
+
+With the measured 72.3% acceptance of the native un-fine-tuned MTP block, expected tokens per
+verify is `(1-p^(K+1))/(1-p)` against a cost of `curve[K+1] + 0.08K`:
+
+| draft depth | E[tokens] | cost | speedup |
+|---|---|---|---|
+| 1 | 1.72 | 2.24 | 0.77x |
+| 2 | 2.25 | 2.36 | **0.95x** |
+| 3 | 2.62 | 2.88 | 0.91x |
+| 7 | 3.34 | 5.54 | 0.60x |
+
+**Every depth is a loss.** And the payoff is boundable for ANY head, which settles whether a
+fine-tune could rescue it: at 85% acceptance the best depth gives 1.02x, at 95% 1.13x, and a
+*perfect* drafter caps at 1.27x. **No draft head is worth building against this curve.**
+
+### Why: fine-grained MoE is structurally hostile to speculation
+
+Profiling widths 1/2/4 separately (dprof rows, ratio to width 1; 0.25 would be perfect at width 4):
+
+| row | w4/w1 | |
+|---|---|---|
+| `mla:absorb_q` | 0.25 | at floor (OPTIMIZATION_LOG #14) |
+| `moe:router` | 0.34 | good |
+| `mla:o_proj` | 0.43 | good |
+| `attn:mla` | 0.46 | good |
+| `attn:kda` | 0.54 | good |
+| `moe:w13+act` | 0.75 | weak |
+| **`ffn:moe`** | **0.82** | **flat, and ~45% of the step** |
+| `moe:w2+combine` | 0.99 | flat |
+| `mla:sdpa`, `mla:indexer` | 0.90, 0.96 | flat (inherently per-token) |
+
+Attention batches. The MoE does not, and it dominates. That is not an implementation defect:
+with 144 experts and top-8 routing, M tokens touch `144*(1-(1-8/144)^M)` DISTINCT experts —
+8.0 per token at M=1, 7.8 at M=2, 7.4 at M=4, 6.6 at M=8, and only 5.4 at M=16. Expert traffic is
+near-linear in M exactly where speculation needs it to be flat. The measured 0.82 is slightly
+BETTER than this model's 0.86, so the expert-gathering kernel (#12) is already beating the naive
+floor. **There is nothing left to win here.**
+
+Note the direction REAP-50 pushed this: 144 experts saturate sooner than the original 288 would,
+so pruning made speculation *less* bad, not more.
+
+### The transferable rule
+
+**Measure the serving-side batching curve before building or capturing for a draft head.** Twice
+now — GGUF and NVFP4 — the head was fine and the target's batch behaviour was the blocker, and
+both times the head was the thing that looked like the work. On GGUF the cause was
+`op_offload_min_batch_size = 32`; here it is expert routing, which no amount of engineering
+removes.

@@ -1,0 +1,42 @@
+[dprof] enabled, 1048576 marks
+engine: dense NVFP4 overlay ACTIVE
+engine: 58840 tensors, 101.85 GiB resident, 45 layers, max_ctx 576
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (12.38 MiB latent cache at 576 ctx)
+streaming read RIGHT NOW: 206.9 GB/s
+prompt 512 tokens, 45 layers, widths: 4, 1 reps, ROUND-ROBIN
+
+  rep 0  width 4      28503.1 ms   55.670 ms/tok     18.0 tok/s
+
+width      min ms/tok   med ms/tok  tok/s (min)
+4              55.670       55.670         18.0
+
+[dprof] prefill (all widths, all reps) — decode step by sub-op, summed over 512 step(s) and all layers
+[dprof] phase                        ms       %    calls     GB/tok     GB/s     %BW
+[dprof] hc:pre_attn              600.25    1.9%     6480    0.0355      30.3    15% 
+[dprof] norm:attn                144.39    0.5%     6480          -        -       -
+[dprof] ATTENTION              13411.79   42.0%     6480    1.1509*     43.9    21% 
+[dprof] hc:post_attn             114.09    0.4%     6480          -        -       -
+[dprof] hc:pre_ffn               596.06    1.9%     6480    0.0355      30.5    15% 
+[dprof] norm:ffn                 145.74    0.5%     6480          -        -       -
+[dprof] FFN                    16801.17   52.6%     6480    3.8550*    117.5    57% 
+[dprof] hc:post_ffn              118.04    0.4%     6480          -        -       -
+[dprof] embed                      4.14    0.0%      144          -        -       -
+[dprof] head:mean                  0.06    0.0%        2          -        -       -
+[dprof] lm_head                    5.69    0.0%        2    0.0014*    125.4    61% 
+[dprof]   attn:kda              9524.84   29.8%     4896    0.7403*     39.8    19% 
+[dprof]   attn:mla              3872.24   12.1%     1584    0.4106*     54.3    26% 
+[dprof]     mla:q_proj           686.97    2.2%     1584    0.0547*     40.8    20% 
+[dprof]     mla:kv               124.08    0.4%     1584    0.0036*     15.1     7% 
+[dprof]     mla:indexer          295.33    0.9%     6336    0.0073*     12.7     6% 
+[dprof]     mla:absorb_q         491.95    1.5%     1584    0.0519*     54.0    26% 
+[dprof]     mla:sdpa             519.24    1.6%     6336    0.1243*    122.6    59% 
+[dprof]     mla:o_proj          1731.24    5.4%     1584    0.1687*     49.9    24% 
+[dprof]       sdpa:scores        265.55    0.8%     6336    0.0073*     14.1     7% 
+[dprof]       sdpa:softmax        38.42    0.1%     6336          -        -       -
+[dprof]       sdpa:context       186.26    0.6%     6336    0.1170*    321.6   155%!
+[dprof]   ffn:moe              15990.16   50.1%     6048    3.7833*    121.1    59% 
+[dprof]   ffn:dense              796.71    2.5%      432    0.0717*     46.1    22% 
+[dprof]     moe:router           220.54    0.7%     6048    0.0139*     32.3    16% 
+[dprof]     moe:w13+act         9125.53   28.6%     6048    2.5129*    141.0    68% 
+[dprof]     moe:w2+combine      6506.43   20.4%     6048    1.2565*     98.9    48% 
+[dprof] TOTAL                  31941.43  (62.39 ms/step, 16.03 tok/s)
