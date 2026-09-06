@@ -200,6 +200,10 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     ws_kda_  = dalloc(owned_, kda_workspace_floats());
     ws_mla_  = dalloc(owned_, mla_workspace_floats(cfg_.max_ctx));
     ws_moe_  = dalloc(owned_, moe_workspace_floats());
+    b_ws_moe_ = dalloc(owned_, moe_batch_workspace_floats(cfg_.max_batch));
+    b_selw_   = dalloc(owned_, (size_t)cfg_.max_batch * N_EXPERT_PER_TOK);
+    { void* p; CU(cudaMalloc(&p, (size_t)cfg_.max_batch * N_EXPERT_PER_TOK * 4));
+      owned_.push_back(p); b_sel_ = (int32_t*)p; }
     ws_mlp_  = dalloc(owned_, dense_mlp_workspace_floats());
     selw_    = dalloc(owned_, N_EXPERT_PER_TOK);
     // Batch activations. At max_batch 16 these total well under 200 MB, which is nothing against
@@ -374,14 +378,12 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
         dprof_begin(DP_FFN, s);
         if (l.moe) {
             dprof_begin(DP_MOE, s);
-            // THE ROUTED EXPERTS ARE NOT BATCHED, and that is a measured choice, not an omission.
-            // At the widths speculation uses, K tokens select almost disjoint expert sets — 29.4
-            // distinct of a possible 32 at K=4 — so batching them would save 4.7% (ROOFLINE §4).
-            // It is worth doing for wide PREFILL chunks, where the 144 experts saturate and the
-            // saving reaches 1.9x at K=32. Until then this reuses the already-gated batch-1 path.
-            for (int m = 0; m < M; ++m)
-                moe_forward(b_normed_ + (size_t)m * HIDDEN, l.ml, b_sub_ + (size_t)m * HIDDEN,
-                            sel_, selw_, ws_moe_, s);
+            // The M tokens go through in ONE set of launches (token = grid.z). Serialising them
+            // was most of why a wide prefill chunk bought nothing: prefill at width 16 measured
+            // 84.0 ms/tok against 81.7 at width 1, and ffn:moe cost the same 35.1 ms per token at
+            // both. The expert weights do not care who reads them, and at M=16 about 42 of the
+            // 128 selections are repeats whose second read now comes out of L2.
+            moe_forward_batch(b_normed_, l.ml, b_sub_, b_sel_, b_selw_, b_ws_moe_, M, s);
             dprof_end(DP_MOE, s);
         } else {
             dprof_begin(DP_DENSE, s);

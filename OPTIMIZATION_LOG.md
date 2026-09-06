@@ -474,3 +474,136 @@ got 1.17x from a full-step graph; that engine had a different launch profile. Do
 bandwidth, that engine at 68% (14.61 tok/s against its 21.42 roofline). The remaining absolute
 difference in tok/s is not kernel quality, it is `B_tok` — 19.761 G/token here against ~11.2 G
 there. No further kernel work moves it much; §3's lever does.
+
+---
+
+## #11 — The activations were the cost all along: NVFP4 dense weights, and prefill
+
+Two levers in one finding. ROOFLINE §3 said quantising the 13.9 G/token of bf16 dense weights
+would halve `B_tok` and be worth ~1.5x. It halved `B_tok` and was worth **1.4%**. Chasing that is
+what produced the finding, and the finding then fixed prefill too.
+
+### What the overlay does
+
+`tools/requant_dense_nvfp4.py` converts every AR-path tensor that is read through `gemv`/`gemm`.
+13.16 GiB of checkpoint becomes a **3.70 GiB overlay** — not a rewritten checkpoint. The base is
+opened read-only, nothing is destroyed, and a family is disabled by not emitting it, so
+`--families` IS the gate at zero runtime cost. `B_tok` 19.761 -> **9.762 G, -50.6%**.
+
+`kv_b_proj` and the hyper-connection `fn` tensors stay bf16 on purpose: MLA reads `kv_b` strided
+inside `k_absorb_q`, not through `gemv`, so converting it would need a second kernel for 1.7% of
+`B_tok`. The MoE router stays bf16 too — 0.05 G, and it decides which experts run.
+
+### Three kernels, and only the third is worth anything
+
+| | | |
+|---|---|---|
+| uint32 loads, shared scale LUT | 8.36 -> **8.48** tok/s | halved the bytes, bought 1.4% |
+| uint4 loads, hardware e4m3 | 8.48 -> **3.55** tok/s | 3.4x worse still |
+| row-tiled, R=5 | 8.36 -> **11.53** tok/s | **1.38x** |
+
+`tools/bench_gemv -DFP4_PROBE` stubs one term of the inner loop at a time. It settled in one run
+what two engine-level A/Bs (20 minutes each) could not:
+
+```
+stub the e2m1 unpack   ->  17.1 GB/s     no change; cvt.rn.f16x2.e2m1x2 is free
+stub the e4m3 scale    ->  17.1 GB/s     no change
+stub the x reads       -> 323.7 GB/s     19x
+```
+
+**A gemv reads 4 bytes of activation per weight.** Against bf16 that is 2 bytes of x per byte of
+weight; against NVFP4 it is **7.1**. bf16 sits at 88-96% of streaming DRAM and is at the right
+wall. NVFP4 asking for 1.7 TB/s of x to match it is not at any wall worth being at. *Halving the
+weight bytes cannot help while x is seven times the weight traffic* — which is why the first
+version removed half of `B_tok` and changed nothing, and why the second, which made each load
+wider, made it worse: a uint4 ties one lane to 32 contiguous weights, so at a fixed offset the
+warp's 32 lanes touch 32 different 128-byte lines and use 4 bytes of each.
+
+So each block owns R output **rows** and reads x once for all of them. R is measured, not
+reasoned, and the peak is sharp:
+
+| R | 2 | 3 | 4 | **5** | 6 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|---|---|
+| GB/s (kda q/k/v) | 115 | 135 | 150 | **161** | 135 | 132 | 100 | 75 |
+
+Final per-shape, against bf16: 1.74x to 3.19x, 112-170 GB/s.
+
+### The same bug was in the batched path, and it was the prefill anomaly
+
+Prefill had never been profiled. It got **worse** with wider chunks — 81.7 ms/tok at width 1,
+68.7 at width 4, **84.0 at width 16** — which is backwards for a path whose entire purpose is to
+amortise a weight read across tokens.
+
+`tools/bench_gemv --m` shows why, and shows it in the **bf16** kernel too:
+
+| M | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| bf16 weight GB/s | 210 | 111 | 56 | 28.7 | 14.2 |
+
+Exactly 1/M. **A gemm reads W once and costs M times as much anyway**, because it reads M rows of
+x per weight and x was already the binding term at M=1. At M=16 that is 40 GB of activation
+traffic for lm_head alone — ~450 GB/s, which is the L2 ceiling this box actually has.
+
+That invalidates ROOFLINE §4's premise as *implemented*: batch cost was not flat in K, it was
+linear, so a multi-token forward saved nothing and speculative verification would have won
+nothing no matter how good the draft head was. The curve is still ours to build; it just was not
+built yet.
+
+Fix: chunk M and tile rows against each other. Per weight the cost is
+`0.5625 * (M/MCHUNK)` of weights plus `4 * MCHUNK / R` of activations, under a register budget of
+roughly `R * MCHUNK`. MCHUNK=4, R=8 measured best (18.2 GB/s on kda o_proj at M=16 against 7.7).
+R=12 and R=16 both lose to register pressure — 93 registers already.
+
+### Batching the MoE over tokens
+
+`forward_batch` ran the routed experts as M sequential `moe_forward` calls, and `ffn:moe` cost the
+same 35.1 ms per token at width 16 as at width 1. The token is now a grid dimension
+(`blockIdx.z`), so the M tokens go through in one set of launches. At `gridDim.z == 1` this is
+exactly the kernel it was, which is why `gate_batch`'s bit-identity still holds.
+
+It is worth 5%, not the 33% the expert-overlap arithmetic suggests, and the reason is worth
+recording: at M=16 about 42 of the 128 expert selections are repeats, but each expert triple is
+4.7 MB and 86 distinct experts is ~400 MB per layer — nothing like an L2 working set, so the
+second read is not served from cache. **The win here is occupancy, not reuse.** Actually saving
+those bytes needs true expert-gathering — one block per distinct expert, looping over its token
+list with the weight row held in registers — and that is a new kernel, not a grid change.
+
+### Where it landed
+
+| | before | after | |
+|---|---|---|---|
+| decode | 8.36 tok/s | **11.86 tok/s** | 1.42x |
+| prefill @ width 16 | 84.0 ms/tok | **61.2 ms/tok** | 1.37x |
+| prefill @ width 1 | 81.7 ms/tok | 81.3 ms/tok | (unbatched, unchanged) |
+| `B_tok` | 19.761 G | **9.762 G** | -50.6% |
+
+Prefill is now flat from width 4 upward (61.3 / 61.2 / 61.8 at 4 / 16 / 32) rather than rising.
+Flat, not falling, because `ffn:moe` is 48% of it and still pays full price per token.
+
+### What this cost in accuracy, and who decides
+
+NVFP4 is e2m1 with one fp8 scale per 16. `gate_nvfp4` reads both the bf16 tensor and the NVFP4
+triple off disk and compares: **rel 0.088-0.100, cos 0.9950-0.9961**, uniform across all seven
+families — the format's own band, not a property of any family. That band is the discriminator: a
+layout bug lands at cos ~0, not at 0.995.
+
+End to end over three KDA layers against the PyTorch oracle, `gate_stack` reports **cos 0.9972**.
+That is a real change and it is the operator's call, not a gate's, so `gate.sh` runs `gate_stack`
+on bf16 for exactness (4/4, cos 1.000000000) and prints the NVFP4 drift beside it as a report.
+The experts in this checkpoint were already NVFP4; this extends 4 bits to the dense weights.
+Reverting any family is a re-run of the requant script with a shorter `--families`, and
+`GLM5_DENSE_NVFP4=0` reverts all of it without touching a file.
+
+### Two traps
+
+**A retained mmap map reads garbage across two loads.** `WeightStore` kept its shard-to-blob maps
+as members. The mmaps die with each `load()`, so the overlay's mmaps landed at the same addresses
+and overlay tensors resolved against base-checkpoint blobs. `gate_stack` came back at cos 0.0005
+with activations of 4e21 — while every kernel gate stayed green, because none of them load two
+directories. The maps are now local to one call.
+
+**A dprof table can report a prefix of the run.** The first prefill profile said 58% of the time
+was outside any kernel. It was not: `moe_forward` records 3 mark pairs per token per MoE layer, so
+a 256-token prefill at width 16 wants ~130k events and the 65536 default captured 41% of them.
+The giveaway was `lm_head` at 27224% of bandwidth. An impossible row is never a fast kernel — and
+here it was not even a wrong byte count, it was a truncated recording.

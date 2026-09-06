@@ -149,6 +149,9 @@ private:
     float* ws_kda_  = nullptr;
     float* ws_mla_  = nullptr;
     float* ws_moe_  = nullptr;
+    float* b_ws_moe_ = nullptr;   // batched MoE: M x (logits + act + partials)
+    float* b_selw_  = nullptr;    // [max_batch, topk]
+    int32_t* b_sel_ = nullptr;    // [max_batch, topk]
     float* ws_mlp_  = nullptr;
     float* pooled_  = nullptr;
     int32_t* sel_   = nullptr;

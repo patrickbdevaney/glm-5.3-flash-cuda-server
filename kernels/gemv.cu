@@ -29,6 +29,24 @@
 #ifndef NVFP4_R
 #define NVFP4_R 5
 #endif
+// Batched (M > 1) shape. A gemm reads W once for all M rows, but it reads M rows of x per
+// weight, and x was already the binding term at M=1 -- so the batched kernel was EXACTLY as slow
+// as M separate gemvs. Measured on the bf16 path too, which is where the prefill anomaly came
+// from: weight bandwidth fell 210 -> 111 -> 56 -> 28.7 -> 14.2 GB/s for M = 1, 2, 4, 8, 16,
+// precisely 1/M, and prefill at width 16 (84.0 ms/tok) was SLOWER than at width 1 (81.7).
+//
+// So M is chunked and rows are tiled against each other. Per weight the cost is
+//     0.5625 * (M / MCHUNK)        weights, re-read once per chunk
+//   + 4 * MCHUNK / R               activations, divided by the rows sharing them
+// under a register budget of roughly R * MCHUNK, which is why RM is expressed as that product.
+// MCHUNK=4, R=8 measured best (18.2 GB/s on kda o_proj at M=16 against 7.7 for the old MB=16,
+// R=2 shape); R=12 and R=16 both lose to register pressure at 93 registers already.
+#ifndef NVFP4_RM
+#define NVFP4_RM 32
+#endif
+#ifndef NVFP4_MCHUNK
+#define NVFP4_MCHUNK 4
+#endif
 #include <cuda_bf16.h>
 #include <cstdio>
 #include <cstdlib>
@@ -297,7 +315,7 @@ __global__ void k_gemm_nvfp4(float* __restrict__ y, const uint8_t* __restrict__ 
 // Rows per block. x traffic per weight is 4*MB/R bytes, so R has to grow with MB to hold it
 // under the 0.5625 bytes the weights themselves cost — but acc[R][MB] and xr[MB][8] both live in
 // registers, so R*MB is the budget and 8 is where it lands.
-template <int MB> struct Rows { static constexpr int v = MB <= 1 ? NVFP4_R : MB <= 4 ? 4 : 2; };
+template <int MB> struct Rows { static constexpr int v = MB <= 1 ? NVFP4_R : NVFP4_RM / MB; };
 
 #define NVFP4_LAUNCH_BS(BS, MB)                                                        \
     k_gemm_nvfp4<BS, MB, Rows<MB>::v><<<(N + Rows<MB>::v - 1) / Rows<MB>::v, BS, 0, s>>>( \
@@ -329,7 +347,7 @@ static void gemm_nvfp4(float* y, const WRef& W, const float* x, int M, int N, in
     int done = 0;
     while (done < M) {
         const int rem = M - done;
-        const int c = rem >= 32 ? 32 : rem >= 16 ? 16 : rem >= 8 ? 8 : rem;
+        const int c = rem >= NVFP4_MCHUNK ? NVFP4_MCHUNK : rem;
         float* yc = y + (size_t)done * N;
         const float* xc = x + (size_t)done * K;
         switch (c) {
@@ -340,9 +358,7 @@ static void gemm_nvfp4(float* y, const WRef& W, const float* x, int M, int N, in
             case 5:  NVFP4_LAUNCH(5);  break;
             case 6:  NVFP4_LAUNCH(6);  break;
             case 7:  NVFP4_LAUNCH(7);  break;
-            case 8:  NVFP4_LAUNCH(8);  break;
-            case 16: NVFP4_LAUNCH(16); break;
-            default: NVFP4_LAUNCH(32); break;
+            default: NVFP4_LAUNCH(8);  break;
         }
         done += c;
     }

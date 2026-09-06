@@ -1,0 +1,17 @@
+engine: dense NVFP4 overlay ACTIVE
+engine: 58840 tensors, 101.85 GiB resident, 45 layers, max_ctx 1600
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (34.38 MiB latent cache at 1600 ctx)
+streaming read RIGHT NOW: 230.8 GB/s
+prompt 256 tokens, 45 layers, widths: 1 4 16, 2 reps, ROUND-ROBIN
+
+  rep 0  width 1      20913.5 ms   81.693 ms/tok     12.2 tok/s
+  rep 0  width 4      17581.5 ms   68.678 ms/tok     14.6 tok/s
+  rep 0  width 16     21503.3 ms   83.997 ms/tok     11.9 tok/s
+  rep 1  width 1      21560.6 ms   84.221 ms/tok     11.9 tok/s
+  rep 1  width 4      17575.6 ms   68.655 ms/tok     14.6 tok/s
+  rep 1  width 16     22045.2 ms   86.114 ms/tok     11.6 tok/s
+
+width      min ms/tok   med ms/tok  tok/s (min)
+1              81.693       84.221         12.2
+4              68.655       68.678         14.6
+16             83.997       86.114         11.9

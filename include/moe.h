@@ -26,6 +26,7 @@ struct MoeLayer {
 };
 
 size_t moe_workspace_floats();
+size_t moe_batch_workspace_floats(int M);
 bool nvfp4_check_align(const Nvfp4Mat& m, const char* what);
 
 // x [HIDDEN] fp32 -> y [HIDDEN] fp32. `sel` [topk] int32 and `wts` [topk] fp32 are written out so
@@ -34,4 +35,12 @@ void moe_forward(const float* x, const MoeLayer& L, float* y, int32_t* sel, floa
                  float* ws, cudaStream_t s);
 void moe_route(const float* x, const MoeLayer& L, int32_t* sel, float* wts, float* logits,
                cudaStream_t s);
+
+// M tokens through the block in ONE set of launches. x and y are [M, HIDDEN]; `sel` is [M, topk]
+// and `wts` [M, topk]. Results at M=1 are bit-identical to moe_forward -- the token index is a
+// grid dimension, so a single-token grid runs exactly the kernel it always ran.
+void moe_forward_batch(const float* x, const MoeLayer& L, float* y, int32_t* sel, float* wts,
+                       float* ws, int M, cudaStream_t s);
+void moe_route_batch(const float* x, const MoeLayer& L, int32_t* sel, float* wts, float* logits,
+                     int M, cudaStream_t s);
 }  // namespace glm5

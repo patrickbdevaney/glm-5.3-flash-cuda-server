@@ -126,6 +126,12 @@ __device__ __forceinline__ float warp_sum(float v) {
 __global__ void k_route(int32_t* __restrict__ sel, float* __restrict__ wts,
                         const float* __restrict__ logits, const float* __restrict__ bias,
                         int E, int K, float scaling, bool norm_prob) {
+    // One BLOCK per token. At M=1 this is the grid it always had, so the routing decision is
+    // bit-identical to the sequential path -- which speculative verification depends on.
+    const int tok = blockIdx.x;
+    logits += (size_t)tok * E;
+    sel    += (size_t)tok * K;
+    wts    += (size_t)tok * K;
     extern __shared__ float sm[];
     float* score  = sm;             // [E] unbiased sigmoid — these become the weights
     float* choice = sm + E;         // [E] biased — these decide the ranking
@@ -171,6 +177,15 @@ __global__ void k_expert_act(float* __restrict__ act, const float* __restrict__ 
                              const Nvfp4Mat* __restrict__ experts,
                              const Nvfp4Mat* __restrict__ shared,
                              const int32_t* __restrict__ sel, int inter, int hid, float limit) {
+    // blockIdx.z is the TOKEN. Running the M tokens of a batch concurrently rather than as M
+    // sequential launches is most of why a wide prefill chunk is worth anything: the expert
+    // weights are the same 0.5945 G whoever reads them, and two tokens that route to the same
+    // expert -- 42 of 128 selections at M=16 -- have the second read served out of L2 instead of
+    // DRAM. At gridDim.z == 1 this is exactly the kernel it was.
+    const int tok = blockIdx.z;
+    x   += (size_t)tok * hid;
+    sel += (size_t)tok * KS;
+    act += (size_t)tok * NS * inter;
     // The activation is staged in shared ONCE per block. Without this, each of the WPB warps
     // re-reads all of x from L1 for both its gate and its up row: at fp32 that is 32 bytes of
     // activation fetched per 4 bytes of weight, and it was what held this kernel to 134 GB/s
@@ -257,6 +272,10 @@ __global__ void k_expert_down(float* __restrict__ part, const float* __restrict_
                               const Nvfp4Mat* __restrict__ experts,
                               const Nvfp4Mat* __restrict__ shared,
                               const int32_t* __restrict__ sel, int inter, int hid) {
+    const int tok = blockIdx.z;
+    act  += (size_t)tok * NS * inter;
+    sel  += (size_t)tok * KS;
+    part += (size_t)tok * NS * hid;
     __shared__ float lut[256];
     extern __shared__ __align__(16) char smem_down[];
     float*  a  = reinterpret_cast<float*>(smem_down);      // [inter]  this block's slot slice
@@ -310,6 +329,10 @@ __global__ void k_expert_down(float* __restrict__ part, const float* __restrict_
 // Fixed slot order, no atomics: bit-identical across runs.
 __global__ void k_down_combine(float* __restrict__ y, const float* __restrict__ part,
                                const float* __restrict__ wts, int hid) {
+    const int tok = blockIdx.y;
+    y    += (size_t)tok * hid;
+    part += (size_t)tok * NS * hid;
+    wts  += (size_t)tok * KS;
     const int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= hid) return;
     float t = 0.f;
@@ -322,8 +345,9 @@ __global__ void k_down_combine(float* __restrict__ y, const float* __restrict__ 
 // ---- entry points ------------------------------------------------------------------------------
 // logits[E] + act[NS*I] + part[NS*H]. The `part` buffer is the price of splitting the down_proj
 // slot loop into the grid; at 147 KB it is noise next to the 5.4 GB/tok this block streams.
-size_t moe_workspace_floats() {
-    return (size_t)N_ROUTED_EXPERT + (size_t)NS * I + (size_t)NS * H;
+size_t moe_workspace_floats() { return moe_batch_workspace_floats(1); }
+size_t moe_batch_workspace_floats(int M) {
+    return (size_t)M * ((size_t)N_ROUTED_EXPERT + (size_t)NS * I + (size_t)NS * H);
 }
 
 // Fail loudly at load time rather than with a misaligned-address fault mid-request.
@@ -339,14 +363,25 @@ bool nvfp4_check_align(const Nvfp4Mat& m, const char* what) {
 
 void moe_route(const float* x, const MoeLayer& L, int32_t* sel, float* wts, float* logits,
                cudaStream_t s) {
-    // The reference computes router logits in fp32 from fp32-upcast weights; gemv does exactly that.
-    gemv(logits, L.router_w, x, L.n_expert, HIDDEN, GEMV_BF16, s);
-    k_route<<<1, 256, 2 * L.n_expert * sizeof(float), s>>>(
+    moe_route_batch(x, L, sel, wts, logits, 1, s);
+}
+
+void moe_route_batch(const float* x, const MoeLayer& L, int32_t* sel, float* wts, float* logits,
+                     int M, cudaStream_t s) {
+    // The reference computes router logits in fp32 from fp32-upcast weights; gemm does exactly
+    // that, and at M=1 gemm IS gemv, bit for bit.
+    gemm(logits, L.router_w, x, M, L.n_expert, HIDDEN, GEMV_BF16, s);
+    k_route<<<M, 256, 2 * L.n_expert * sizeof(float), s>>>(
         sel, wts, logits, L.router_bias, L.n_expert, L.topk, ROUTED_SCALE, NORM_TOPK_PROB);
 }
 
 void moe_forward(const float* x, const MoeLayer& L, float* y, int32_t* sel, float* wts,
                  float* ws, cudaStream_t s) {
+    moe_forward_batch(x, L, y, sel, wts, ws, 1, s);
+}
+
+void moe_forward_batch(const float* x, const MoeLayer& L, float* y, int32_t* sel, float* wts,
+                       float* ws, int M, cudaStream_t s) {
     constexpr int WPB = 8;                       // 8 warps = 256 threads per block
     // Read once: getenv in a per-layer hot path would cost more than the kernel it selects.
     static const bool HALF = [] {
@@ -354,27 +389,27 @@ void moe_forward(const float* x, const MoeLayer& L, float* y, int32_t* sel, floa
         return e && *e == '1';
     }();
     float* logits = ws;
-    float* act    = ws + N_ROUTED_EXPERT;
-    float* part   = act + (size_t)NS * I;
+    float* act    = ws + (size_t)M * N_ROUTED_EXPERT;
+    float* part   = act + (size_t)M * NS * I;
     dprof_begin(DP_E_ROUTER, s);
-    moe_route(x, L, sel, wts, logits, s);
+    moe_route_batch(x, L, sel, wts, logits, M, s);
     dprof_end(DP_E_ROUTER, s);
     dprof_begin(DP_E_ACT, s);
     if (HALF)
-        k_expert_act<WPB, true><<<dim3((I + WPB - 1) / WPB, NS), WPB * 32, H * sizeof(__half), s>>>(
+        k_expert_act<WPB, true><<<dim3((I + WPB - 1) / WPB, NS, M), WPB * 32, H * sizeof(__half), s>>>(
             act, x, L.experts, L.shared, sel, I, H, SWIGLU_LIMIT);
     else
-        k_expert_act<WPB, false><<<dim3((I + WPB - 1) / WPB, NS), WPB * 32, H * sizeof(float), s>>>(
+        k_expert_act<WPB, false><<<dim3((I + WPB - 1) / WPB, NS, M), WPB * 32, H * sizeof(float), s>>>(
             act, x, L.experts, L.shared, sel, I, H, SWIGLU_LIMIT);
     dprof_end(DP_E_ACT, s);
     dprof_begin(DP_E_DOWN, s);
     if (HALF)
-        k_expert_down<WPB, true><<<dim3((H + WPB - 1) / WPB, NS), WPB * 32, I * sizeof(__half), s>>>(
+        k_expert_down<WPB, true><<<dim3((H + WPB - 1) / WPB, NS, M), WPB * 32, I * sizeof(__half), s>>>(
             part, act, L.experts, L.shared, sel, I, H);
     else
-        k_expert_down<WPB, false><<<dim3((H + WPB - 1) / WPB, NS), WPB * 32, I * sizeof(float), s>>>(
+        k_expert_down<WPB, false><<<dim3((H + WPB - 1) / WPB, NS, M), WPB * 32, I * sizeof(float), s>>>(
             part, act, L.experts, L.shared, sel, I, H);
-    k_down_combine<<<(H + 255) / 256, 256, 0, s>>>(y, part, wts, H);
+    k_down_combine<<<dim3((H + 255) / 256, M), 256, 0, s>>>(y, part, wts, H);
     dprof_end(DP_E_DOWN, s);
 }
 

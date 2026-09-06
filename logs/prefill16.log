@@ -1,0 +1,33 @@
+[dprof] enabled, 1048576 marks
+engine: dense NVFP4 overlay ACTIVE
+engine: 58840 tensors, 101.85 GiB resident, 45 layers, max_ctx 192
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (4.12 MiB latent cache at 192 ctx)
+streaming read RIGHT NOW: 185.4 GB/s
+prompt 128 tokens, 45 layers, widths: 16, 1 reps, ROUND-ROBIN
+
+  rep 0  width 16     10474.6 ms   81.833 ms/tok     12.2 tok/s
+
+width      min ms/tok   med ms/tok  tok/s (min)
+16             81.833       81.833         12.2
+
+[dprof] prefill (all widths, all reps) — decode step by sub-op, summed over 128 step(s) and all layers
+[dprof] phase                        ms       %    calls     GB/tok     GB/s     %BW
+[dprof] hc:pre_attn              195.28    1.2%      540      0.035     23.3     13%
+[dprof] norm:attn                 44.14    0.3%      540          -        -       -
+[dprof] ATTENTION               7917.36   50.3%      540      3.990     64.5     35%
+[dprof] hc:post_attn              37.51    0.2%      540          -        -       -
+[dprof] hc:pre_ffn               193.14    1.2%      540      0.035     23.5     13%
+[dprof] norm:ffn                  43.65    0.3%      540          -        -       -
+[dprof] FFN                     7248.03   46.1%      540      5.656     99.9     54%
+[dprof] hc:post_ffn               40.10    0.3%      540          -        -       -
+[dprof] embed                      1.38    0.0%       12          -        -       -
+[dprof] head:mean                  0.03    0.0%        2          -        -       -
+[dprof] lm_head                    6.08    0.0%        2      0.357   7515.5   4054%
+[dprof]   attn:kda              5715.16   36.3%      408      3.014     67.5     36%
+[dprof]   attn:mla              2200.89   14.0%      132      0.976     56.8     31%
+[dprof]   ffn:moe               6733.81   42.8%      504      5.401    102.7     55%
+[dprof]   ffn:dense              512.90    3.3%       36      0.255     63.6     34%
+[dprof]     moe:router           223.85    1.4%     8064      0.050     28.6     15%
+[dprof]     moe:w13+act         4301.54   27.4%     8064      3.568    106.2     57%
+[dprof]     moe:w2+combine      2177.07   13.8%     8064      1.783    104.8     57%
+[dprof] TOTAL                  15726.70  (122.86 ms/step, 8.14 tok/s)

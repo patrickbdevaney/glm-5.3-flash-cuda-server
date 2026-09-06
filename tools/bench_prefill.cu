@@ -68,6 +68,12 @@ int main(int argc, char** argv) {
         }
     }
     if (widths.empty()) widths = {1, 4, 16};
+    setenv("GLM5_DPROF", "1", 1);        // this tool exists to profile; always on
+    // The pool must hold every mark or the table silently reports a PREFIX of the run: moe_forward
+    // alone records 3 pairs per token per MoE layer, so a 256-token prefill at width 16 wants
+    // ~130k events and the 65536 default captured 41% of them. The giveaway was lm_head at
+    // 27224% of bandwidth -- an impossible row is never a fast kernel (dprof.h).
+    dprof_init(1 << 20);
     ec.max_batch = *std::max_element(widths.begin(), widths.end());
     // Every rep re-prefills from scratch, so the cache has to hold reps*widths.size() prompts.
     ec.max_ctx = npr * (int)widths.size() * reps + 64;
