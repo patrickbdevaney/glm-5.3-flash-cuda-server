@@ -16,6 +16,17 @@
 //    instrumented path stays asynchronous. A sync per phase would itself create the stalls we are
 //    hunting -- the trap `dspark_forward_head` fell into.
 //  - The pool is fixed-size; overflow stops recording rather than reallocating mid-measurement.
+//  - A row over 100% of bandwidth is flagged with `!`. It used to mean exactly one thing -- a
+//    wrong byte count, never a fast kernel. It now means one of TWO things, and they are told
+//    apart by asking whether the tensor fits in L2:
+//      * a wrong byte count (still the usual cause, and how the MoE router's double-count was
+//        caught in OPTIMIZATION_LOG #9), or
+//      * traffic genuinely served from L2 rather than DRAM, which %BW's denominator does not
+//        model. The MLA latent cache is the known case: OPTIMIZATION_LOG #15 measured it at
+//        487-610 GB/s against a 237 GB/s streaming read, which is why `sdpa:context` prints over
+//        100% and is nonetheless correct.
+//    Weights are far too large to be resident, so any weight-dominated row over 100% is still a
+//    bug in the count.
 //  - Children are checked against their parent and the report says INVALID rather than printing a
 //    plausible-looking table, because a mark recorded outside its parent's window is silent.
 #pragma once
@@ -54,6 +65,30 @@ void dprof_init(int max_marks = 65536);
 // Rescale the byte model for the ROOFLINE §3 NVFP4 dense overlay. The engine calls this at load
 // time; without it every AR-path row is priced against weights the engine is no longer reading.
 void dprof_set_nvfp4_dense(bool on);
+// ---- measured byte accounting ----
+//
+// kBytes below is a PER-DECODED-TOKEN WEIGHT MODEL, and in prefill that is simply the wrong
+// question: a weight read at chunk width M serves M tokens, so every gemm-backed row was priced
+// ~M/ceil(M/MCHUNK) too high. It showed: `ffn:moe` printed 105% of bandwidth and `lm_head` 11399%,
+// and by this file's own rule a row over 100% is a wrong byte count, never a fast kernel.
+//
+// MoE is worse than wrong-by-a-factor. Since the expert-gathering kernel (OPTIMIZATION_LOG #12)
+// each distinct expert is read once per chunk rather than once per (token, slot), so the true
+// count is DATA-DEPENDENT -- it depends on how many distinct experts M tokens happened to route
+// to -- and no constant can express it.
+//
+// So the launch sites report what they actually read. dprof_bytes() credits every mark that is
+// currently open, which makes a parent row the sum of its children for free. A row with measured
+// bytes is priced from them; a row without falls back to the kBytes constant.
+void dprof_bytes(double bytes);            // credit all currently-open marks
+void dprof_bytes_to(int id, double bytes); // credit one row (for counts only known at report time)
+
+// Registered by a translation unit that can only resolve its byte count at report time -- MoE,
+// whose work-item count lives in a device counter and would cost a stream sync to read early.
+// Called with credit=true from dprof_report, and credit=false from dprof_reset so a
+// warm-up's work is discarded rather than billed to the timed run.
+void dprof_set_flush(void (*fn)(bool credit));
+
 void dprof_begin(int id, cudaStream_t s = 0);
 void dprof_end(int id, cudaStream_t s = 0);
 void dprof_reset();

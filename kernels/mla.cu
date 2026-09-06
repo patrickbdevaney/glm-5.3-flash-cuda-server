@@ -46,6 +46,11 @@ namespace glm5 {
 
 // Hh and Lk come from mla_context.cuh, which the k_context family needs to be self-contained
 // for tools/bench_context.cu.
+// Latent-cache traffic: `reads` full passes over n rows of 512 fp32. The sparse twins' count
+// lives on the device, so above DENSE_CTX_LIMIT this uses the selector's cap -- exact whenever it
+// saturates, which is the regime that matters.
+#define DPCACHE(n, reads) dprof_bytes((double)(reads) * (double)(n) * MLA_KV_LORA * 4.0)
+
 static constexpr int Dq = MLA_QK_NOPE;    // 256
 static constexpr int Dv = MLA_V_HEAD;     // 256
 static constexpr int ROW = Dq + Dv;       // 512 rows of kv_b per head
@@ -337,16 +342,20 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
     k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new, t);
     dprof_end(DP_M_KV, s);
 
+    dprof_bytes((double)Hh * Dq * Lk * 2.0);
     k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
     constexpr int TT = 8;
-    k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+    DPCACHE(n_tok, 1);
+        k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
     k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
     constexpr int HG = MLA_HG;
     constexpr int NT = MLA_NT;
-    k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
+    DPCACHE(n_tok, Hh / HG);
+        k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
     KCHK("k_context_part");
     k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx, cpart);
     KCHK("k_context_reduce");
+    dprof_bytes((double)Hh * Dv * Lk * 2.0);
     k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
     gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
 }
@@ -382,6 +391,7 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
     // Absorb for ALL M tokens first: it depends only on q and kv_b, not on the cache or on any
     // other token's attention, so hoisting it out of the loop is free and reads kv_b MG times
     // instead of M.
+    dprof_bytes((double)MG * Hh * Dq * Lk * 2.0);              // W_k half of kv_b, once per chunk
     k_absorb_q_batch<MLA_MB><<<dim3(Hh, MG), Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b, M);
 
     for (int m = 0; m < M; ++m) {
@@ -389,16 +399,19 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
         float* qa_m  = qa  + (size_t)m * Hh * Lk;
         float* ctx_m = ctx + (size_t)m * Hh * Lk;
         constexpr int TT = 8;
+        DPCACHE(n_tok, 1);
         k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
         constexpr int HG = MLA_HG;
         constexpr int NT = MLA_NT;
+        DPCACHE(n_tok, Hh / HG);
         k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
         KCHK("k_context_part");
         k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx_m, cpart);
         KCHK("k_context_reduce");
     }
 
+    dprof_bytes((double)MG * Hh * Dv * Lk * 2.0);              // W_v half of kv_b
     k_expand_v_batch<128, MLA_MB><<<dim3(Hh * Dv, MG), 128, 0, s>>>(
         heads, ctx, (const __nv_bfloat16*)W.kv_b, M);
     gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);
@@ -446,6 +459,7 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     dprof_end(DP_M_INDEXER, s);
 
     dprof_begin(DP_M_ABSORB, s);
+    dprof_bytes((double)Hh * Dq * Lk * 2.0);
     k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
     dprof_end(DP_M_ABSORB, s);
     constexpr int TT = 8;
@@ -459,12 +473,14 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
         // Dense attention is the same answer for less work — bit-identically, which
         // tests/gate_mla_sparse.cu asserts for all 2051 steps.
         dprof_begin(DP_S_SCORES, s);
+        DPCACHE(n_tok, 1);
         k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
         dprof_end(DP_S_SCORES, s);
         dprof_begin(DP_S_SOFTMAX, s);
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
         dprof_end(DP_S_SOFTMAX, s);
         dprof_begin(DP_S_CONTEXT, s);
+        DPCACHE(n_tok, Hh / HG);
         k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
         KCHK("k_context_part");
         k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx, cpart);
@@ -477,12 +493,14 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
         indexer_select(x, q_resid, IW, IS, t, sel, nsel, iws, s);
         constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;        // worst-case grid, count on device
         dprof_begin(DP_S_SCORES, s);
+        DPCACHE(n_tok < IDX_OUT_WIDTH ? n_tok : IDX_OUT_WIDTH, 1);
         k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa, cache, sel, nsel, max_ctx, scaling);
         dprof_end(DP_S_SCORES, s);
         dprof_begin(DP_S_SOFTMAX, s);
         k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
         dprof_end(DP_S_SOFTMAX, s);
         dprof_begin(DP_S_CONTEXT, s);
+        DPCACHE(n_tok < IDX_OUT_WIDTH ? n_tok : IDX_OUT_WIDTH, Hh / HG);
         k_context_sel_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, sel, nsel, max_ctx);
         KCHK("k_context_sel_part");
         k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx, cpart);
@@ -492,6 +510,7 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     dprof_end(DP_M_SDPA, s);
 
     dprof_begin(DP_M_OPROJ, s);
+    dprof_bytes((double)Hh * Dv * Lk * 2.0);
     k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
     gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
     dprof_end(DP_M_OPROJ, s);
@@ -539,6 +558,7 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
     // Absorb for all M at once. Safe to hoist above the indexer: k_absorb_q reads only q and kv_b,
     // and the indexer's pool state is untouched by it.
     dprof_begin(DP_M_ABSORB, s);
+    dprof_bytes((double)MG * Hh * Dq * Lk * 2.0);              // W_k half of kv_b, once per chunk
     k_absorb_q_batch<MLA_MB><<<dim3(Hh, MG), Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b, M);
     dprof_end(DP_M_ABSORB, s);
 
@@ -557,13 +577,15 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
         dprof_begin(DP_M_SDPA, s);
         if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
             dprof_begin(DP_S_SCORES, s);
-            k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
+            DPCACHE(n_tok, 1);
+        k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
             dprof_end(DP_S_SCORES, s);
             dprof_begin(DP_S_SOFTMAX, s);
             k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
             dprof_end(DP_S_SOFTMAX, s);
             dprof_begin(DP_S_CONTEXT, s);
-            k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
+            DPCACHE(n_tok, Hh / HG);
+        k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
             KCHK("k_context_part");
             k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx_m, cpart);
             KCHK("k_context_reduce");
@@ -573,13 +595,15 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
                            sel, nsel, iws, s);
             constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;
             dprof_begin(DP_S_SCORES, s);
-            k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa_m, cache, sel, nsel, max_ctx, scaling);
+            DPCACHE(n_tok < IDX_OUT_WIDTH ? n_tok : IDX_OUT_WIDTH, 1);
+        k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa_m, cache, sel, nsel, max_ctx, scaling);
             dprof_end(DP_S_SCORES, s);
             dprof_begin(DP_S_SOFTMAX, s);
             k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
             dprof_end(DP_S_SOFTMAX, s);
             dprof_begin(DP_S_CONTEXT, s);
-            k_context_sel_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, sel, nsel, max_ctx);
+            DPCACHE(n_tok < IDX_OUT_WIDTH ? n_tok : IDX_OUT_WIDTH, Hh / HG);
+        k_context_sel_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, sel, nsel, max_ctx);
             KCHK("k_context_sel_part");
             k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx_m, cpart);
             KCHK("k_context_reduce");
@@ -590,6 +614,7 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
 
     // expand_v sits with o_proj because that is where mla_decode_step_dsa puts it.
     dprof_begin(DP_M_OPROJ, s);
+    dprof_bytes((double)MG * Hh * Dv * Lk * 2.0);              // W_v half of kv_b
     k_expand_v_batch<128, MLA_MB><<<dim3(Hh * Dv, MG), 128, 0, s>>>(
         heads, ctx, (const __nv_bfloat16*)W.kv_b, M);
     gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);

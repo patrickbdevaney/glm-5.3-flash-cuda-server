@@ -18,6 +18,7 @@
 // dies on real weights. gemv() therefore measures alignment at launch and dispatches to a scalar
 // variant when the vector path would be illegal - never assumes.
 #include "gemv.h"
+#include "dprof.h"
 #include "nvfp4.cuh"
 #ifndef FP4_PROBE
 #define FP4_PROBE 0
@@ -344,6 +345,10 @@ static void gemm_nvfp4(float* y, const WRef& W, const float* x, int M, int N, in
     // K must be a multiple of 16 (the NVFP4 group). tools/requant_dense_nvfp4.py refuses to emit
     // anything else, so a violation here means the overlay and the engine disagree about a shape.
     if (K & 15) { fprintf(stderr, "gemm_nvfp4: K=%d is not a multiple of 16\n", K); abort(); }
+    // W is streamed once per chunk of the M loop, NOT once per call and NOT once per token. That
+    // pass count is the whole reason the old per-token model mispriced prefill, so it is counted
+    // here, where the chunking actually happens, rather than modelled anywhere else.
+    dprof_bytes((double)((M + NVFP4_MCHUNK - 1) / NVFP4_MCHUNK) * N * K * 0.5625);
     int done = 0;
     while (done < M) {
         const int rem = M - done;
@@ -378,8 +383,15 @@ static void gemm_nvfp4(float* y, const WRef& W, const float* x, int M, int N, in
         }                                                                                        \
     } while (0)
 
+// Bytes on the wire per weight. NVFP4 is 0.5 for the packed nibble plus one f8 scale per group of
+// 16, so 0.5625 -- the same figure ROOFLINE §3 uses.
+static inline double wbytes(const WRef& W, int dtype) {
+    return W.nvfp4() ? 0.5625 : (dtype == GEMV_F32 ? 4.0 : 2.0);
+}
+
 void gemv(float* y, const WRef& Wr, const float* x, int N, int K, int dtype, cudaStream_t s) {
-    if (Wr.nvfp4()) { gemm(y, Wr, x, 1, N, K, dtype, s); return; }
+    if (Wr.nvfp4()) { gemm(y, Wr, x, 1, N, K, dtype, s); return; }   // gemm does the accounting
+    dprof_bytes((double)N * K * wbytes(Wr, dtype));
     const void* W = Wr.p;
     switch (gemv_bs(K)) {
         case 32:  GEMV_LAUNCH(32);  break;
@@ -595,6 +607,11 @@ void gemm(float* y, const WRef& Wr, const float* x, int M, int N, int K, int dty
     if (Wr.nvfp4()) { gemm_nvfp4(y, Wr, x, M, N, K, s); return; }
     const void* W = Wr.p;
     const bool vok = vec16_ok(W, K, dtype == GEMV_F32 ? 4 : 2);
+    {   // one pass over W per chunk; mirror the chunk sizes chosen below exactly
+        int d = 0, passes = 0;
+        while (d < M) { const int r = M - d; d += r >= 32 ? 32 : r >= 16 ? 16 : r >= 8 ? 8 : r; ++passes; }
+        dprof_bytes((double)passes * N * K * wbytes(Wr, dtype));
+    }
     int done = 0;
     while (done < M) {
         const int rem = M - done;

@@ -24,9 +24,10 @@ for g in gate_kda gate_moe gate_layer gate_mla; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $K -o build/$g && echo "built build/$g"
 done
 # the indexer needs no engine and no checkpoint shards: its oracle dumps its own inputs
+# gemv.cu reports its weight bytes to dprof, so dprof.cu is now part of every link that has it.
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_indexer.cu kernels/indexer.cu kernels/gemv.cu \
-     -o build/gate_indexer && echo "built build/gate_indexer"
-nvcc -O2 -std=c++17 $ARCH -I include tests/gate_nvfp4.cu kernels/gemv.cu \
+     kernels/dprof.cu -o build/gate_indexer && echo "built build/gate_indexer"
+nvcc -O2 -std=c++17 $ARCH -I include tests/gate_nvfp4.cu kernels/gemv.cu kernels/dprof.cu \
      -o build/gate_nvfp4 && echo "built build/gate_nvfp4"
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_mla_sparse.cu $K \
      -o build/gate_mla_sparse && echo "built build/gate_mla_sparse"

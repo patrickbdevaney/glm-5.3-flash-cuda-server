@@ -356,6 +356,8 @@ static constexpr int TT = 4;                     // (token, slot) pairs per work
 // One block. Counts how many pairs each expert got, lays them out contiguously, and emits one
 // work item per (expert, tile of TT pairs). The shared expert goes first and covers every token,
 // so it is always present and the routed groups follow it.
+__device__ unsigned long long g_moe_work = 0;
+
 __global__ void k_build_work(const int32_t* __restrict__ sel, int M, int E,
                              int32_t* __restrict__ n_work, int32_t* __restrict__ w_eid,
                              int32_t* __restrict__ w_start, int32_t* __restrict__ w_n,
@@ -384,6 +386,10 @@ __global__ void k_build_work(const int32_t* __restrict__ sel, int M, int E,
             p += cnt[e];
         }
         *n_work = w;
+        // Every work item streams one expert's weights exactly once, so this counter IS the MoE
+        // byte model. It cannot be a constant: how many distinct experts M tokens route to is
+        // data-dependent, which is precisely what the old M*(KS+1) figure got wrong.
+        atomicAdd(&g_moe_work, (unsigned long long)w);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < M * KS; i += (int)blockDim.x) {
@@ -643,6 +649,23 @@ void moe_route_batch(const float* x, const MoeLayer& L, int32_t* sel, float* wts
         sel, wts, logits, L.router_bias, L.n_expert, L.topk, ROUTED_SCALE, NORM_TOPK_PROB);
 }
 
+// Read the device work counter and turn it into bytes. Deferred to report time because reading
+// it per layer would mean a stream sync per layer -- the exact stall dprof exists to avoid.
+// Each work item reads gate+up (2*I*H) in the act kernel and down (I*H) in the down kernel, at
+// 0.5625 B/weight: the MoE experts are NVFP4 in the checkpoint.
+static void moe_flush_bytes(bool credit) {
+    unsigned long long w = 0, z = 0;
+    if (cudaMemcpyFromSymbol(&w, g_moe_work, sizeof(w)) != cudaSuccess) return;
+    cudaMemcpyToSymbol(g_moe_work, &z, sizeof(z));
+    if (!credit) return;
+    const double per = (double)I * H * 0.5625;
+    dprof_bytes_to(DP_E_ACT,  (double)w * 2.0 * per);
+    dprof_bytes_to(DP_E_DOWN, (double)w * 1.0 * per);
+    dprof_bytes_to(DP_MOE,    (double)w * 3.0 * per);
+    dprof_bytes_to(DP_FFN,    (double)w * 3.0 * per);
+}
+namespace { struct MoeFlushReg { MoeFlushReg(){ dprof_set_flush(&moe_flush_bytes); } } g_moe_flush_reg; }
+
 void moe_forward(const float* x, const MoeLayer& L, float* y, int32_t* sel, float* wts,
                  float* ws, cudaStream_t s) {
     moe_forward_batch(x, L, y, sel, wts, ws, 1, s);
@@ -691,6 +714,12 @@ void moe_forward_batch(const float* x, const MoeLayer& L, float* y, int32_t* sel
         return;
     }
 
+    // Ungathered path: every (token, slot) block reads its expert in full, so the count is
+    // exactly M*NS and the host knows it.
+    dprof_bytes_to(DP_E_ACT,  (double)M * NS * 2.0 * I * H * 0.5625);
+    dprof_bytes_to(DP_E_DOWN, (double)M * NS * 1.0 * I * H * 0.5625);
+    dprof_bytes_to(DP_MOE,    (double)M * NS * 3.0 * I * H * 0.5625);
+    dprof_bytes_to(DP_FFN,    (double)M * NS * 3.0 * I * H * 0.5625);
     dprof_begin(DP_E_ACT, s);
     if (HALF)
         k_expert_act<WPB, true><<<dim3((I + WPB - 1) / WPB, NS, M), WPB * 32, H * sizeof(__half), s>>>(

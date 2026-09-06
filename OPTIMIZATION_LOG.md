@@ -880,3 +880,77 @@ in `kernels/mla.cu` stopped the run — after the earlier targets were already w
 13/13 green on code that did not compile. `build.sh` now deletes every target before building.
 CLAUDE.md §2 says a gate that passes against a dead engine is worse than no gate; this is how one
 gets created by accident.
+
+---
+
+## 16. The byte model stops being a model
+
+`ffn:moe` printed **105% of bandwidth** and `lm_head` **11399%**, and by `dprof.h`'s own rule a row
+over 100% is a wrong byte count, never a fast kernel. Both were. The cause was structural, not a
+typo: `kBytes` is a **per-decoded-token weight model**, and in prefill a weight read serves M
+tokens. Every gemm-backed row was priced ~`M/ceil(M/MCHUNK)` too high — about 4x at width 32.
+
+MoE was worse than wrong-by-a-factor. Since the expert-gathering kernel (#12), each distinct expert
+is read once per chunk rather than once per (token, slot), so the true count depends on **how many
+distinct experts M tokens happened to route to**. That is data-dependent. No constant can express
+it, and the old `M*(KS+1)` figure was 2.62x high at width 32.
+
+### So the launch sites report what they actually read
+
+- `dprof_bytes(b)` credits every mark that is **currently open**. Marks nest, so a parent row
+  becomes the exact sum of its children for free, with nobody maintaining that relationship.
+  (`dprof_end` now clears `g_open`, which it never did — the flag had meant "has ever been opened".)
+- `gemv`/`gemm` report their own weight bytes, counting **one pass per chunk of the M loop**, at
+  the site where the chunking actually happens rather than modelling it elsewhere.
+- MoE reports from a **device counter**: `k_build_work` atomically accumulates its work-item count,
+  and a flush hook converts it to bytes at report time. Reading it per layer would mean a stream
+  sync per layer — the exact stall dprof exists to avoid. The hook takes a `credit` flag so
+  `dprof_reset` discards a warm-up's work instead of billing it to the timed run.
+- `k_absorb_q`/`k_expand_v` report `kv_b`, the MLA kernels report latent-cache passes, and the KDA
+  recurrence reports its state — none of these are weights, so no gemm would have counted them.
+
+A measured row prints `*`. A row with no measurement falls back to the old constant, which is
+still right at width 1.
+
+### The validation: at M=1 the old model was correct, so the new one must reproduce it
+
+That is a comparison whose sign was known in advance (CLAUDE.md §6.4), and it is the only reason to
+believe the counters. Decode, measured vs the hand-derived ROOFLINE §1 constants:
+
+| row | modelled | measured | |
+|---|---|---|---|
+| `ffn:moe` | 5.401 | 5.4004 | 0.01% |
+| `moe:w13+act` | 3.568 | 3.5673 | 0.02% |
+| `moe:w2+combine` | 1.783 | 1.7836 | 0.03% |
+| `moe:router` | 0.050 | 0.0495 | 1.0% |
+| `lm_head` | 0.357 | 0.3568 | 0.06% |
+| `kda:qkv+conv` | 1.927 | 1.925 | 0.1% |
+| `ATTENTION` | 3.990 | 3.9247 | 1.6% |
+
+An independent device counter landing on four significant figures of a figure derived by hand from
+safetensors headers is as strong a cross-check as this repo has. Where they disagree slightly
+(`kda:gates`, modelled 0.141 vs measured 0.065) the measurement is from the actual gemv shapes and
+the constant was the guess.
+
+### What the prefill table says now (width 32, prompt 2048)
+
+| row | was | now |
+|---|---|---|
+| `ffn:moe` | 5.401 G/tok, **105%** | 2.061 G/tok, **39%** |
+| `FFN` | 6.307, 105% | 2.126, 38% |
+| `ATTENTION` | 3.990, 65% | 1.312, 23% |
+| `lm_head` | 0.357, **11399%** | 0.0003, 53% |
+
+Prefill is **weight-cheap** — that is what batching bought — and the time is going to activations
+and occupancy, not to streaming weights. The old table hid that behind numbers over 100%.
+
+### The impossible-row rule needed refining, not defending
+
+`sdpa:context` now prints **204%**, and it is *correct*. That row is the MLA latent cache, which #15
+established is L2-resident and measured at 487-610 GB/s against a 237 GB/s streaming read; `%BW`'s
+denominator models DRAM and does not know about L2. So the rule now has two branches, told apart by
+asking whether the tensor fits in L2 — and since weights never do, a weight-dominated row over 100%
+is still a bug in the count. Rows over 100% are flagged `!` rather than left to look absurd.
+
+Two build consequences: `gemv.cu` now references dprof, so `gate_indexer` and `gate_nvfp4` link
+`kernels/dprof.cu` (they failed to link before this was noticed).

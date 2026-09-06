@@ -104,13 +104,30 @@ void dprof_end(int id, cudaStream_t s){
     cudaEventRecord(g_pool[g_used], s);
     g_id[g_used] = -1 - id;                 // negative marks an END
     ++g_used;
+    g_open[id] = -1;   // g_open now means IS OPEN RIGHT NOW, which is what dprof_bytes needs
 }
 
-void dprof_reset(){ g_used = 0; for (int i = 0; i < DP_N; ++i) g_open[i] = -1; }
+static double g_bytes[DP_N] = {0};
+static void (*g_flush)(bool) = nullptr;
+
+void dprof_set_flush(void (*fn)(bool)){ g_flush = fn; }
+void dprof_bytes_to(int id, double b){ if (g_dprof_on) g_bytes[id] += b; }
+
+// Credit every open mark. Marks nest (ATTENTION > attn:mla > mla:q_proj), so this is what makes a
+// parent row the exact sum of its children without anyone maintaining that relationship by hand.
+void dprof_bytes(double b){
+    if (!g_dprof_on) return;
+    for (int i = 0; i < DP_N; ++i) if (g_open[i] >= 0) g_bytes[i] += b;
+}
+
+void dprof_reset(){ g_used = 0;
+    for (int i = 0; i < DP_N; ++i) { g_open[i] = -1; g_bytes[i] = 0.0; }
+    if (g_flush) g_flush(false); }
 
 void dprof_report(const char* tag, int n_steps, double bw_gbs){
     if (!g_dprof_on || !g_used) return;
     cudaDeviceSynchronize();
+    if (g_flush) g_flush(true);      // MoE's device work counter, read once, after the sync
 
     double sum[DP_N] = {0}; int cnt[DP_N] = {0}; int open_idx[DP_N];
     for (int i = 0; i < DP_N; ++i) open_idx[i] = -1;
@@ -137,11 +154,17 @@ void dprof_report(const char* tag, int n_steps, double bw_gbs){
 
     for (int i = 0; i < DP_N; ++i) {
         if (!cnt[i]) continue;
-        if (bw_gbs > 0 && kBytes[i] > 0) {
-            const double gbs = kBytes[i] * n_steps / (sum[i] / 1000.0) / 1e9;
-            printf("[dprof] %-20s %10.2f %6.1f%% %8d %10.3f %8.1f %6.0f%%\n",
+        // Measured wins over modelled. `*` marks a row priced from bytes the launch sites actually
+        // reported; an unmarked row is still the per-decoded-token constant and is only right at
+        // batch width 1.
+        const bool meas = g_bytes[i] > 0;
+        if (bw_gbs > 0 && (meas || kBytes[i] > 0)) {
+            const double tokb = meas ? g_bytes[i] / n_steps : kBytes[i];
+            const double gbs  = tokb * n_steps / (sum[i] / 1000.0) / 1e9;
+            const double pct = 100.0 * gbs / bw_gbs;
+            printf("[dprof] %-20s %10.2f %6.1f%% %8d %9.4f%c %8.1f %5.0f%%%c\n",
                    kName[i], sum[i], 100.0 * sum[i] / tot, cnt[i],
-                   kBytes[i] / 1e9, gbs, 100.0 * gbs / bw_gbs);
+                   tokb / 1e9, meas ? '*' : ' ', gbs, pct, pct > 100.0 ? '!' : ' ');
         } else if (bw_gbs > 0) {
             printf("[dprof] %-20s %10.2f %6.1f%% %8d %10s %8s %7s\n",
                    kName[i], sum[i], 100.0 * sum[i] / tot, cnt[i], "-", "-", "-");
