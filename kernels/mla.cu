@@ -32,6 +32,17 @@ namespace glm5 {
 #define CU(x) do { cudaError_t e_=(x); if(e_){ fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__, \
     cudaGetErrorString(e_)); abort(); } } while(0)
 
+// A LAUNCH THAT FAILS ON RESOURCES DOES NOTHING AND COSTS NOTHING, AND THAT LOOKS LIKE A WIN.
+// Sweeping k_context's HG (heads per block) reported HG=32 as 6.3x faster than HG=16 and HG=64
+// faster still -- 12x off the trend line the other points sat on. Both were
+// "too many resources requested for launch": acc[HG] at 512 threads exceeds the per-thread
+// register budget, the kernel never ran, and dprof honestly timed an empty stream slot. Only
+// gate_mla caught it. cudaGetLastError is a host-side thread-local read with no sync, so this is
+// affordable per launch, and the alternative is believing a number that is 12x too good.
+#define KCHK(name) do { cudaError_t e_ = cudaGetLastError(); if (e_) { \
+    fprintf(stderr, "cuda launch %s (%s:%d): %s\n", name, __FILE__, __LINE__, \
+            cudaGetErrorString(e_)); abort(); } } while(0)
+
 static constexpr int Hh = MLA_HEADS;      // 64
 static constexpr int Dq = MLA_QK_NOPE;    // 256
 static constexpr int Dv = MLA_V_HEAD;     // 256
@@ -43,6 +54,13 @@ static constexpr int ROW = Dq + Dv;       // 512 rows of kv_b per head
 // larger spills, which costs more than the extra reuse buys.
 #ifndef MLA_MB
 #define MLA_MB 8
+#endif
+
+// Heads per block in k_context. Lowering it multiplies BOTH the block count and the cache traffic
+// by the same factor, so sweeping it separates an occupancy-bound kernel from a traffic-bound one
+// with a known sign in each direction. See OPTIMIZATION_LOG #15.
+#ifndef MLA_HG
+#define MLA_HG 4
 #endif
 
 // workspace: q_resid[1536] | q[16384] | c_new[512] | qa[64*512] | scores[64*max_ctx] |
@@ -339,8 +357,9 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
     constexpr int TT = 8;
     k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
     k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
-    constexpr int HG = 16;
+    constexpr int HG = MLA_HG;
     k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+    KCHK("k_context");
     k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
     gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
 }
@@ -384,8 +403,9 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
         constexpr int TT = 8;
         k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
-        constexpr int HG = 16;
+        constexpr int HG = MLA_HG;
         k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, n_tok, max_ctx);
+        KCHK("k_context");
     }
 
     k_expand_v_batch<128, MLA_MB><<<dim3(Hh * Dv, MG), 128, 0, s>>>(
@@ -437,7 +457,7 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b);
     dprof_end(DP_M_ABSORB, s);
     constexpr int TT = 8;
-    constexpr int HG = 16;
+    constexpr int HG = MLA_HG;
 
     dprof_begin(DP_M_SDPA, s);
     if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
@@ -445,18 +465,32 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
         // scoring and selecting would burn a top-k over every pool to arrive at "all of them".
         // Dense attention is the same answer for less work — bit-identically, which
         // tests/gate_mla_sparse.cu asserts for all 2051 steps.
+        dprof_begin(DP_S_SCORES, s);
         k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+        dprof_end(DP_S_SCORES, s);
+        dprof_begin(DP_S_SOFTMAX, s);
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
+        dprof_end(DP_S_SOFTMAX, s);
+        dprof_begin(DP_S_CONTEXT, s);
         k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+        KCHK("k_context");
+        dprof_end(DP_S_CONTEXT, s);
     } else {
         // The indexer consumes the SAME q_resid the attention does — it is the q-side LoRA output,
         // not a separate projection. Computing it twice would waste a gemv and give the two a way
         // to drift apart.
         indexer_select(x, q_resid, IW, IS, t, sel, nsel, iws, s);
         constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;        // worst-case grid, count on device
+        dprof_begin(DP_S_SCORES, s);
         k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa, cache, sel, nsel, max_ctx, scaling);
+        dprof_end(DP_S_SCORES, s);
+        dprof_begin(DP_S_SOFTMAX, s);
         k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
+        dprof_end(DP_S_SOFTMAX, s);
+        dprof_begin(DP_S_CONTEXT, s);
         k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
+        KCHK("k_context_sel");
+        dprof_end(DP_S_CONTEXT, s);
     }
     dprof_end(DP_M_SDPA, s);
 
@@ -511,7 +545,7 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
     dprof_end(DP_M_ABSORB, s);
 
     constexpr int TT = 8;
-    constexpr int HG = 16;
+    constexpr int HG = MLA_HG;
     for (int m = 0; m < M; ++m) {
         const int t = pos0 + m, n_tok = t + 1;
         float* qa_m  = qa  + (size_t)m * Hh * Lk;
@@ -523,16 +557,30 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
 
         dprof_begin(DP_M_SDPA, s);
         if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
+            dprof_begin(DP_S_SCORES, s);
             k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
+            dprof_end(DP_S_SCORES, s);
+            dprof_begin(DP_S_SOFTMAX, s);
             k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
+            dprof_end(DP_S_SOFTMAX, s);
+            dprof_begin(DP_S_CONTEXT, s);
             k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, n_tok, max_ctx);
+            KCHK("k_context");
+            dprof_end(DP_S_CONTEXT, s);
         } else {
             indexer_select(x + (size_t)m * HIDDEN, q_resid + (size_t)m * MLA_Q_LORA, IW, IS, t,
                            sel, nsel, iws, s);
             constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;
+            dprof_begin(DP_S_SCORES, s);
             k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa_m, cache, sel, nsel, max_ctx, scaling);
+            dprof_end(DP_S_SCORES, s);
+            dprof_begin(DP_S_SOFTMAX, s);
             k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
+            dprof_end(DP_S_SOFTMAX, s);
+            dprof_begin(DP_S_CONTEXT, s);
             k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, sel, nsel, max_ctx);
+            KCHK("k_context_sel");
+            dprof_end(DP_S_CONTEXT, s);
         }
         dprof_end(DP_M_SDPA, s);
     }

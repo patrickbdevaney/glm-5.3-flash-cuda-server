@@ -36,6 +36,10 @@ enum DProfId {
     DP_K_QKVCONV, DP_K_GATES, DP_K_NORMQK, DP_K_RECUR, DP_K_OUTNORM, DP_K_OPROJ,
     // inside MLA
     DP_M_QPROJ, DP_M_KV, DP_M_INDEXER, DP_M_ABSORB, DP_M_SDPA, DP_M_OPROJ,
+    // level 3, inside DP_M_SDPA. It is the only MLA row that grows with context -- everything
+    // else in the engine costs the same at token 100 and token 3000 -- so which of its three
+    // kernels owns it decides whether the long-context lever is cache traffic or occupancy.
+    DP_S_SCORES, DP_S_SOFTMAX, DP_S_CONTEXT,
 
     // ---- level 2: DP_FFN split by flavour (42 MoE layers vs 3 dense). ----
     DP_MOE, DP_DENSE,

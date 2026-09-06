@@ -22,6 +22,7 @@ static const char* kName[DP_N] = {
     "    kda:out_norm", "    kda:o_proj",
     "    mla:q_proj", "    mla:kv", "    mla:indexer", "    mla:absorb_q", "    mla:sdpa",
     "    mla:o_proj",
+    "      sdpa:scores", "      sdpa:softmax", "      sdpa:context",
     "  ffn:moe", "  ffn:dense",
     "    moe:router", "    moe:w13+act", "    moe:w2+combine",
 };
@@ -50,6 +51,7 @@ static double kBytes[DP_N] = {
     // 180% of bandwidth. A dash is the honest cell; a wrong number here invites a wrong lever.
     /* mla:q_proj    */ 0.0, /* mla:kv */ 0.0, /* mla:indexer */ 0.0, /* mla:absorb_q */ 0.0,
     /* mla:sdpa      */ 0.0, /* mla:o_proj */ 0.0,
+    /* sdpa:scores   */ 0.0, /* sdpa:softmax */ 0.0, /* sdpa:context */ 0.0,
     /* ffn:moe       */ 5.401e9, /* ffn:dense */ 0.906e9,
     /* moe:router    */ 0.050e9, /* moe:w13+act */ 3.568e9, /* moe:w2+combine */ 1.783e9,
 };
