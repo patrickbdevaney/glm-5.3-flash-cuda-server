@@ -329,13 +329,17 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     const int n_tok = t + 1;
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
 
+    dprof_begin(DP_M_QPROJ, s);
     gemv(q_resid, W.q_a, x, MLA_Q_LORA, HIDDEN, W.dtype, s);
     rmsnorm(q_resid, q_resid, W.q_a_norm, W.dtype, MLA_Q_LORA, s);
     gemv(q, W.q_b, q_resid, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+    dprof_end(DP_M_QPROJ, s);
 
+    dprof_begin(DP_M_KV, s);
     gemv(c_new, W.kv_a, x, Lk, HIDDEN, W.dtype, s);
     rmsnorm(c_new, c_new, W.kv_a_norm, W.dtype, Lk, s);
     k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new, t);
+    dprof_end(DP_M_KV, s);
 
     // THE POOL STATE MUST BE MAINTAINED FROM TOKEN 0, EVEN WHILE ATTENTION IS STILL DENSE.
     // Pool keys are built incrementally as each group of 4 tokens completes, so a run that only
@@ -391,25 +395,45 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
     float* ctx     = scores + (size_t)Hh * max_ctx;
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
 
+    // The sub-phase marks mirror mla_decode_step_dsa's EXACTLY, including which kernels go in
+    // which bucket, so the prefill and decode tables can be read against each other. That is the
+    // whole reason to have them: attn:mla is 23.8% of prefill at 35% of achievable bandwidth and
+    // an undifferentiated row cannot say whether that is the projections (which batch) or the
+    // per-token attention loop (which does not).
+    //
+    // Marks inside the loop open and close M times and dprof sums them, so the `calls` column
+    // reads M per chunk for those rows and 1 for the batched projections -- which is itself the
+    // measurement: a row whose call count scales with M is a row that did not get batched.
+    dprof_begin(DP_M_QPROJ, s);
     gemm(q_resid, W.q_a, x, M, MLA_Q_LORA, HIDDEN, W.dtype, s);
     for (int m = 0; m < M; ++m)
         rmsnorm(q_resid + (size_t)m * MLA_Q_LORA, q_resid + (size_t)m * MLA_Q_LORA,
                 W.q_a_norm, W.dtype, MLA_Q_LORA, s);
     gemm(q, W.q_b, q_resid, M, MLA_Q_DIM, MLA_Q_LORA, W.dtype, s);
+    dprof_end(DP_M_QPROJ, s);
 
+    dprof_begin(DP_M_KV, s);
     gemm(c_new, W.kv_a, x, M, Lk, HIDDEN, W.dtype, s);
     for (int m = 0; m < M; ++m)
         rmsnorm(c_new + (size_t)m * Lk, c_new + (size_t)m * Lk, W.kv_a_norm, W.dtype, Lk, s);
     for (int m = 0; m < M; ++m)
         k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new + (size_t)m * Lk, pos0 + m);
+    dprof_end(DP_M_KV, s);
 
     constexpr int TT = 8;
     constexpr int HG = 16;
     for (int m = 0; m < M; ++m) {
         const int t = pos0 + m, n_tok = t + 1;
         // Pool state is incremental and must advance for EVERY token, dense branch or not.
+        dprof_begin(DP_M_INDEXER, s);
         indexer_keys(x + (size_t)m * HIDDEN, IW, IS, t, iws, s);
+        dprof_end(DP_M_INDEXER, s);
+
+        dprof_begin(DP_M_ABSORB, s);
         k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q + (size_t)m * MLA_Q_DIM, (const __nv_bfloat16*)W.kv_b);
+        dprof_end(DP_M_ABSORB, s);
+
+        dprof_begin(DP_M_SDPA, s);
         if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
             k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
             k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
@@ -422,11 +446,18 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
             k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
             k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
         }
+        dprof_end(DP_M_SDPA, s);
+
+        // expand_v sits with o_proj here because that is where mla_decode_step_dsa puts it.
+        dprof_begin(DP_M_OPROJ, s);
         k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads + (size_t)m * Hh * Dv, ctx,
                                                 (const __nv_bfloat16*)W.kv_b);
+        dprof_end(DP_M_OPROJ, s);
     }
 
+    dprof_begin(DP_M_OPROJ, s);
     gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);
+    dprof_end(DP_M_OPROJ, s);
 }
 
 }  // namespace glm5

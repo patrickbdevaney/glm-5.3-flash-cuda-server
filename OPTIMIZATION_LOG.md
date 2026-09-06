@@ -678,3 +678,48 @@ efficiency, and its sub-phase marks do not exist in the batch path, so attributi
 marks first. `ffn:moe` is 38.4% and its byte model now over-reports (the row reads >100%) because
 `kBytes` still prices M*8 expert reads rather than the distinct count; that row is a wrong byte
 count, in the direction that means the gathering is working.
+
+---
+
+## #13 — MLA sub-phase marks, and what they say
+
+`mla_batch_step_dsa` had no sub-phase marks at all, and `mla_decode_step_dsa` was missing two —
+`DP_M_QPROJ` and `DP_M_KV` existed only in the non-DSA `mla_decode_step`, which the engine never
+calls. So `attn:mla`'s children summed to 217 of 278 ms in the decode table and 0 of 5405 in
+prefill. Both paths are now marked identically, including which kernel goes in which bucket, so
+the two tables can be read against each other. Children now account for **99.2%** of `attn:mla` in
+decode and **99.4%** in prefill.
+
+### The call counts are the finding
+
+| row | ms | calls | |
+|---|---|---|---|
+| `mla:q_proj` | 681 | 198 | = 11 layers x 18 chunks — **batched** |
+| `mla:kv` | 120 | 198 | **batched** |
+| `mla:indexer` | 287 | 6336 | = 198 x 32 — **per token** |
+| `mla:absorb_q` | 861 | 6336 | **per token** |
+| `mla:sdpa` | 965 | 6336 | **per token** |
+| `mla:o_proj` | 2460 | 6534 | 6336 `expand_v` + 198 batched gemm |
+
+A row whose call count scales with M is a row that did not get batched. **The projections are 15%
+of MLA and the per-token attention loop is 85%** (~4570 of 5405 ms at chunk 32).
+
+### `kv_b` is read twice per token, and ROOFLINE counts it once
+
+`k_absorb_q` and `k_expand_v` each stream the whole of `kv_b` — bf16 `[32768, 512]`, 33.55 MB per
+MLA layer — and both run per token. From the decode table: `absorb_q` is 0.1425 ms/call, i.e.
+**235 GB/s**, which is the machine; `expand_v` (o_proj's 0.561 ms/call less the ~0.337 ms the
+NVFP4 gemm takes) is ~150 GB/s. Neither is a slow kernel. They are simply reading 67.1 MB per
+token per layer.
+
+Over 11 layers that is **0.738 G/token, 7.6% of `B_tok`** — and ROOFLINE §1 prices `kv_b` at
+0.344 G because it counts one read, not two. **This corrects OPTIMIZATION_LOG #11**, which
+dismissed converting `kv_b` as "1.7% of `B_tok` for a second kernel". It is 7.6%, and the second
+kernel now has a much better case.
+
+### What that makes the next MLA lever
+
+Batching `absorb_q` and `expand_v` over the M tokens, so `kv_b` is read once per chunk instead of
+M times. It is the same insight as #11 and #12 — the weight does not care who reads it — and it is
+the last place in the engine where a per-token loop streams a whole tensor. Converting `kv_b` to
+NVFP4 is worth 3.55x on top of that, but batching comes first and is worth ~M.
