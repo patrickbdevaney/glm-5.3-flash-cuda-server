@@ -723,3 +723,68 @@ Batching `absorb_q` and `expand_v` over the M tokens, so `kv_b` is read once per
 M times. It is the same insight as #11 and #12 — the weight does not care who reads it — and it is
 the last place in the engine where a per-token loop streams a whole tensor. Converting `kv_b` to
 NVFP4 is worth 3.55x on top of that, but batching comes first and is worth ~M.
+
+---
+
+## 14. Batching `absorb_q` and `expand_v` over the chunk — prefill 50.66 → 47.79 ms/tok
+
+The lever #13 named, built. `k_absorb_q` and `k_expand_v` each stream the whole of `kv_b`
+(bf16 `[32768, 512]`, 33.55 MB per MLA layer) and both ran once per token. Now a block owns
+(head, chunk of `MLA_MB` tokens) and reads each weight once for all of them, so `kv_b` traffic per
+chunk falls by `min(M, MLA_MB)` rather than not at all.
+
+Two structural changes made it possible:
+
+- **`absorb_q` hoists out of the per-token loop entirely.** It reads only `q` and `kv_b` — not the
+  cache, not the indexer state, not any other token's attention — so computing all M up front is
+  free. `qa` becomes `[M, 64, 512]`.
+- **`ctx` becomes per-token** (`[M, 64, 512]`), because `expand_v` can only batch if every token's
+  context survives until the end of the loop. That is 4 MiB apiece at M=32, paid once.
+
+`scores` stays single-token: the score/softmax/context chain is still serial, and one
+`[64, max_ctx]` scratch is all it needs.
+
+`MLA_MB = 8`. Larger spills `acc[]` out of registers at 512 threads, which costs more than the
+extra reuse buys. The `if (i < nm)` guards sit inside `#pragma unroll` loops over a compile-time
+bound for the same reason — a runtime bound forces the accumulator to local memory.
+
+### The A/B
+
+`-DMLA_MB=1` keeps the hoisted structure and removes only the per-block reuse, so it isolates the
+traffic change rather than the launch-count change. Same widths, same prompt, round-robin, two
+reps; the MB=8 run's own streaming probe read *lower* (227.7 vs 233.7 GB/s), so if anything this
+understates the gain.
+
+| row | MB=1 | MB=8 | |
+|---|---|---|---|
+| `mla:absorb_q` | 1762.07 ms | 320.44 ms | **5.50x** |
+| `mla:o_proj` (incl. `expand_v`) | 4511.15 | 2818.15 | 1.60x |
+| `attn:mla` | 11310.03 | 8190.14 | 1.38x |
+| `ATTENTION` | 28507.00 | 25390.60 | 1.12x |
+| TOTAL | 56461.08 | 53405.92 | 1.06x |
+
+| width | MB=1 min ms/tok | MB=8 min ms/tok |
+|---|---|---|
+| 16 | 51.275 | 48.523 |
+| 32 | 50.656 | **47.793** |
+
+**The control is what makes this a measurement.** `mla:sdpa` and `mla:indexer` were not touched by
+this change and must not move: sdpa reads 3015.68 → 3019.78 ms, 0.14%. A run where the untouched
+rows drifted would not be readable at 6%.
+
+The `calls` column closes the diagnosis #13 opened: `absorb_q` and `o_proj` now read 550, the same
+as the batched projections, where they read 550xM before. Only `indexer` and `sdpa` still scale
+with M, and both are inherently per-query.
+
+### Why 6% and not ~M
+
+Because `absorb_q` was only 3.1% of prefill to begin with. The kernel itself got 5.5x — the byte
+model was right — but Amdahl caps what that is worth end to end. `attn:mla` is now 15.3% of
+prefill (was 20.0%) at 54% of achievable bandwidth (was 38%), and inside it the remaining mass is
+`sdpa` (3020 ms) and the `o_proj` gemm. **`sdpa` is now the largest MLA row**, and it is cache
+traffic, not weight traffic — a different problem from every lever in this log so far.
+
+Converting `kv_b` to NVFP4 is still worth 3.55x on what `absorb_q`/`expand_v` read, but that is
+now 0.6% and 5.3% of prefill respectively, so it buys far less than it would have before this
+change. It has moved from "next" to "probably not worth a second kernel" — the honest reversal of
+what #13 predicted, in the direction that matters.

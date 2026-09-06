@@ -32,9 +32,10 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
 
 // M tokens through one MLA layer in one pass. Positions are pos0 .. pos0+M-1.
 //
-// The projections are batched (2.584 G/token, 13.1% of B_tok, read once for all M). The attention
-// itself loops per token, because it is cheap in weights and expensive only in CACHE, and the cache
-// re-read is ~1% of a 4-wide forward.
+// The projections are batched (2.584 G/token, 13.1% of B_tok, read once for all M), and so are
+// absorb_q and expand_v, which each stream the whole of kv_b (33.55 MB/layer). Only the
+// score/softmax/context chain loops per token: it is cheap in WEIGHTS and expensive only in
+// CACHE, and the cache re-read is ~1% of a 4-wide forward.
 //
 // CAUSALITY WITHIN THE BATCH is why all M latents are stored before any attention runs: token m
 // must see tokens pos0..pos0+m, including its own batch-mates that precede it. Attending first and
@@ -57,8 +58,8 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const struct Index
                          int32_t* sel, int32_t* nsel, float* y, float* ws, float* iws,
                          cudaStream_t s, bool force_sparse = false);
 
-// Batched twin. Projections are batched as in mla_batch_step; the indexer and the attention run
-// per token inside the same loop, because both are inherently per-query.
+// Batched twin. Projections, absorb_q and expand_v are batched as in mla_batch_step; the indexer
+// and the score/softmax/context chain run per token, because both are inherently per-query.
 void mla_batch_step_dsa(const float* x, const MlaWeights& W, const struct IndexerWeights& IW,
                         struct IndexerState& IS, float* cache, int pos0, int M, int max_ctx,
                         int32_t* sel, int32_t* nsel, float* y, float* ws, float* iws,

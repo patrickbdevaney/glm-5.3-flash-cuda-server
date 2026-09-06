@@ -38,6 +38,13 @@ static constexpr int Dv = MLA_V_HEAD;     // 256
 static constexpr int Lk = MLA_KV_LORA;    // 512
 static constexpr int ROW = Dq + Dv;       // 512 rows of kv_b per head
 
+// Tokens per block in the batched absorb/expand kernels. Every weight byte is read once per chunk,
+// so kv_b traffic per chunk falls by min(M, MLA_MB). 8 keeps acc[] in registers at 512 threads;
+// larger spills, which costs more than the extra reuse buys.
+#ifndef MLA_MB
+#define MLA_MB 8
+#endif
+
 // workspace: q_resid[1536] | q[16384] | c_new[512] | qa[64*512] | scores[64*max_ctx] |
 //            ctx[64*512] | heads[16384]
 size_t mla_workspace_floats(int max_ctx) {
@@ -45,11 +52,13 @@ size_t mla_workspace_floats(int max_ctx) {
          + (size_t)Hh * Lk + (size_t)Hh * Dv;
 }
 
-// Per-token buffers scale with M; the attention scratch (qa/scores/ctx) does not, because the
-// attention loops one token at a time.
+// qa AND ctx are now per-token, because absorb_q and expand_v batch over M (see
+// k_absorb_q_batch). That costs M*64*512 floats each -- 4 MiB apiece at M=32 -- to stop kv_b
+// being streamed M times per layer. Only `scores` stays single-token: the score/softmax/context
+// chain is still serial over tokens, so one [64, max_ctx] scratch is reused.
 size_t mla_batch_workspace_floats(int max_ctx, int M) {
     return (size_t)M * (MLA_Q_LORA + MLA_Q_DIM + Lk + (size_t)Hh * Dv)
-         + (size_t)Hh * Lk + (size_t)Hh * max_ctx + (size_t)Hh * Lk;
+         + (size_t)M * Hh * Lk + (size_t)Hh * max_ctx + (size_t)M * Hh * Lk;
 }
 
 // qa[h][l] = sum_{d<256} q[h][d] * kv_b[(h*512 + d)*512 + l]
@@ -62,6 +71,40 @@ __global__ void k_absorb_q(float* __restrict__ qa, const float* __restrict__ q,
     float acc = 0.f;
     for (int d = 0; d < Dq; ++d) acc += q[(size_t)h * Dq + d] * __bfloat162float(Wk[(size_t)d * Lk + l]);
     qa[(size_t)h * Lk + l] = acc;
+}
+
+// Batched twin. THIS IS THE POINT OF THE WHOLE CHANGE: k_absorb_q streams the entire W_k half of
+// kv_b (bf16 [32768, 512], 33.55 MB per layer) for ONE token, and the prefill loop called it once
+// per token. With the dprof sub-phase marks in place the call counts said so outright -- absorb_q
+// and expand_v at 6336 calls (198 x 32) against 198 for the projections -- and together they were
+// 0.738 G/token, 7.6% of B_tok, where ROOFLINE §1 prices one read at 0.344 G.
+//
+// A block now owns (head, chunk of MB tokens) and reads each weight ONCE for all MB of them. It is
+// the same insight as the MoE expert gathering and the row-tiled NVFP4 gemv: the weight does not
+// care who reads it, so the fix is always to widen the consumer, never to speed up the read.
+//
+// The `if (i < nm)` inside an unrolled loop over a compile-time bound is deliberate -- a runtime
+// bound would push acc[] out of registers and into local memory, which costs more than the tail
+// block saves.
+template <int MB>
+__global__ void k_absorb_q_batch(float* __restrict__ qa, const float* __restrict__ q,
+                                 const __nv_bfloat16* __restrict__ kv_b, int M) {
+    const int h = blockIdx.x, l = threadIdx.x;
+    const int m0 = blockIdx.y * MB;
+    const int nm = (M - m0) < MB ? (M - m0) : MB;
+    const __nv_bfloat16* Wk = kv_b + (size_t)h * ROW * Lk;
+    float acc[MB];
+    #pragma unroll
+    for (int i = 0; i < MB; ++i) acc[i] = 0.f;
+    for (int d = 0; d < Dq; ++d) {
+        const float w = __bfloat162float(Wk[(size_t)d * Lk + l]);   // one coalesced 1 KB row
+        #pragma unroll
+        for (int i = 0; i < MB; ++i)
+            if (i < nm) acc[i] += q[(size_t)(m0 + i) * MLA_Q_DIM + (size_t)h * Dq + d] * w;
+    }
+    #pragma unroll
+    for (int i = 0; i < MB; ++i)
+        if (i < nm) qa[((size_t)(m0 + i) * Hh + h) * Lk + l] = acc[i];
 }
 
 // s[h][t] = qa[h] . C[t] * scaling
@@ -229,6 +272,40 @@ __global__ void k_expand_v(float* __restrict__ out, const float* __restrict__ ct
     if (threadIdx.x == 0) { float v = 0; for (int k = 0; k < BS / 32; ++k) v += red[k]; out[(size_t)h * Dv + d] = v; }
 }
 
+// Batched twin of k_expand_v: same block-per-(head, output dim), same reduction order, but the
+// 512-element W_v row is read once for MB tokens instead of once per token. Requires ctx to have
+// been kept for all M tokens, which is why the workspace grew.
+template <int BS, int MB>
+__global__ void k_expand_v_batch(float* __restrict__ out, const float* __restrict__ ctx,
+                                 const __nv_bfloat16* __restrict__ kv_b, int M) {
+    const int hd = blockIdx.x, h = hd / Dv, d = hd - h * Dv;
+    const int m0 = blockIdx.y * MB;
+    const int nm = (M - m0) < MB ? (M - m0) : MB;
+    const __nv_bfloat16* Wv = kv_b + ((size_t)h * ROW + Dq + d) * Lk;
+    float acc[MB];
+    #pragma unroll
+    for (int i = 0; i < MB; ++i) acc[i] = 0.f;
+    for (int l = threadIdx.x; l < Lk; l += BS) {
+        const float w = __bfloat162float(Wv[l]);
+        #pragma unroll
+        for (int i = 0; i < MB; ++i)
+            if (i < nm) acc[i] += ctx[((size_t)(m0 + i) * Hh + h) * Lk + l] * w;
+    }
+    __shared__ float red[MB][BS / 32];
+    #pragma unroll
+    for (int i = 0; i < MB; ++i) {
+        float a = acc[i];
+        for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+        if ((threadIdx.x & 31) == 0) red[i][threadIdx.x >> 5] = a;
+    }
+    __syncthreads();
+    if ((int)threadIdx.x < nm) {
+        float v = 0;                                          // same order as k_expand_v
+        for (int k = 0; k < BS / 32; ++k) v += red[threadIdx.x][k];
+        out[((size_t)(m0 + threadIdx.x) * Hh + h) * Dv + d] = v;
+    }
+}
+
 __global__ void k_store_latent(float* __restrict__ cache, const float* __restrict__ c_new, int t) {
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l < Lk) cache[(size_t)t * Lk + l] = c_new[l];
@@ -274,10 +351,11 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
     float* q       = q_resid + (size_t)M * MLA_Q_LORA;          // [M, 16384]
     float* c_new   = q + (size_t)M * MLA_Q_DIM;                 // [M, 512]
     float* heads   = c_new + (size_t)M * Lk;                    // [M, 16384]
-    float* qa      = heads + (size_t)M * Hh * Dv;               // [64, 512]  one token at a time
-    float* scores  = qa + (size_t)Hh * Lk;                      // [64, max_ctx]
-    float* ctx     = scores + (size_t)Hh * max_ctx;             // [64, 512]
+    float* qa      = heads + (size_t)M * Hh * Dv;               // [M, 64, 512]
+    float* scores  = qa + (size_t)M * Hh * Lk;                  // [64, max_ctx]  one token at a time
+    float* ctx     = scores + (size_t)Hh * max_ctx;             // [M, 64, 512]
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));   // 1/16
+    const int MG = (M + MLA_MB - 1) / MLA_MB;
 
     gemm(q_resid, W.q_a, x, M, MLA_Q_LORA, HIDDEN, W.dtype, s);
     for (int m = 0; m < M; ++m)
@@ -294,18 +372,24 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
     for (int m = 0; m < M; ++m)
         k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new + (size_t)m * Lk, pos0 + m);
 
+    // Absorb for ALL M tokens first: it depends only on q and kv_b, not on the cache or on any
+    // other token's attention, so hoisting it out of the loop is free and reads kv_b MG times
+    // instead of M.
+    k_absorb_q_batch<MLA_MB><<<dim3(Hh, MG), Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b, M);
+
     for (int m = 0; m < M; ++m) {
         const int n_tok = pos0 + m + 1;
-        k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q + (size_t)m * MLA_Q_DIM, (const __nv_bfloat16*)W.kv_b);
+        float* qa_m  = qa  + (size_t)m * Hh * Lk;
+        float* ctx_m = ctx + (size_t)m * Hh * Lk;
         constexpr int TT = 8;
-        k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+        k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
         constexpr int HG = 16;
-        k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
-        k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads + (size_t)m * Hh * Dv, ctx,
-                                                (const __nv_bfloat16*)W.kv_b);
+        k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, n_tok, max_ctx);
     }
 
+    k_expand_v_batch<128, MLA_MB><<<dim3(Hh * Dv, MG), 128, 0, s>>>(
+        heads, ctx, (const __nv_bfloat16*)W.kv_b, M);
     gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);
 }
 
@@ -390,20 +474,20 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
     float* q       = q_resid + (size_t)M * MLA_Q_LORA;
     float* c_new   = q + (size_t)M * MLA_Q_DIM;
     float* heads   = c_new + (size_t)M * Lk;
-    float* qa      = heads + (size_t)M * Hh * Dv;
-    float* scores  = qa + (size_t)Hh * Lk;
-    float* ctx     = scores + (size_t)Hh * max_ctx;
+    float* qa      = heads + (size_t)M * Hh * Dv;               // [M, 64, 512]
+    float* scores  = qa + (size_t)M * Hh * Lk;                  // [64, max_ctx]
+    float* ctx     = scores + (size_t)Hh * max_ctx;             // [M, 64, 512]
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
+    const int MG = (M + MLA_MB - 1) / MLA_MB;
 
     // The sub-phase marks mirror mla_decode_step_dsa's EXACTLY, including which kernels go in
     // which bucket, so the prefill and decode tables can be read against each other. That is the
-    // whole reason to have them: attn:mla is 23.8% of prefill at 35% of achievable bandwidth and
-    // an undifferentiated row cannot say whether that is the projections (which batch) or the
-    // per-token attention loop (which does not).
+    // whole reason to have them: they are what showed absorb_q and expand_v running M times per
+    // layer, each streaming the whole of kv_b, which is what the two batched kernels below fix.
     //
-    // Marks inside the loop open and close M times and dprof sums them, so the `calls` column
-    // reads M per chunk for those rows and 1 for the batched projections -- which is itself the
-    // measurement: a row whose call count scales with M is a row that did not get batched.
+    // Marks around a per-token kernel still open and close M times and dprof sums them, so the
+    // `calls` column remains the measurement: a row whose call count scales with M is a row that
+    // did not get batched. After this change only indexer and sdpa should read M.
     dprof_begin(DP_M_QPROJ, s);
     gemm(q_resid, W.q_a, x, M, MLA_Q_LORA, HIDDEN, W.dtype, s);
     for (int m = 0; m < M; ++m)
@@ -420,42 +504,43 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
         k_store_latent<<<(Lk + 255) / 256, 256, 0, s>>>(cache, c_new + (size_t)m * Lk, pos0 + m);
     dprof_end(DP_M_KV, s);
 
+    // Absorb for all M at once. Safe to hoist above the indexer: k_absorb_q reads only q and kv_b,
+    // and the indexer's pool state is untouched by it.
+    dprof_begin(DP_M_ABSORB, s);
+    k_absorb_q_batch<MLA_MB><<<dim3(Hh, MG), Lk, 0, s>>>(qa, q, (const __nv_bfloat16*)W.kv_b, M);
+    dprof_end(DP_M_ABSORB, s);
+
     constexpr int TT = 8;
     constexpr int HG = 16;
     for (int m = 0; m < M; ++m) {
         const int t = pos0 + m, n_tok = t + 1;
+        float* qa_m  = qa  + (size_t)m * Hh * Lk;
+        float* ctx_m = ctx + (size_t)m * Hh * Lk;
         // Pool state is incremental and must advance for EVERY token, dense branch or not.
         dprof_begin(DP_M_INDEXER, s);
         indexer_keys(x + (size_t)m * HIDDEN, IW, IS, t, iws, s);
         dprof_end(DP_M_INDEXER, s);
 
-        dprof_begin(DP_M_ABSORB, s);
-        k_absorb_q<<<Hh, Lk, 0, s>>>(qa, q + (size_t)m * MLA_Q_DIM, (const __nv_bfloat16*)W.kv_b);
-        dprof_end(DP_M_ABSORB, s);
-
         dprof_begin(DP_M_SDPA, s);
         if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
-            k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
+            k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
             k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
-            k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
+            k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, n_tok, max_ctx);
         } else {
             indexer_select(x + (size_t)m * HIDDEN, q_resid + (size_t)m * MLA_Q_LORA, IW, IS, t,
                            sel, nsel, iws, s);
             constexpr int NB = (IDX_OUT_WIDTH + TT - 1) / TT;
-            k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa, cache, sel, nsel, max_ctx, scaling);
+            k_scores_sel<TT><<<NB, TT * 32, 0, s>>>(scores, qa_m, cache, sel, nsel, max_ctx, scaling);
             k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
-            k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
+            k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, sel, nsel, max_ctx);
         }
         dprof_end(DP_M_SDPA, s);
-
-        // expand_v sits with o_proj here because that is where mla_decode_step_dsa puts it.
-        dprof_begin(DP_M_OPROJ, s);
-        k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads + (size_t)m * Hh * Dv, ctx,
-                                                (const __nv_bfloat16*)W.kv_b);
-        dprof_end(DP_M_OPROJ, s);
     }
 
+    // expand_v sits with o_proj because that is where mla_decode_step_dsa puts it.
     dprof_begin(DP_M_OPROJ, s);
+    k_expand_v_batch<128, MLA_MB><<<dim3(Hh * Dv, MG), 128, 0, s>>>(
+        heads, ctx, (const __nv_bfloat16*)W.kv_b, M);
     gemm(y, W.o_proj, heads, M, HIDDEN, Hh * Dv, W.dtype, s);
     dprof_end(DP_M_OPROJ, s);
 }
