@@ -7,13 +7,13 @@
 namespace glm5 {
 
 struct MlaWeights {
-    const void* q_a;         // bf16 [1536, 4096]
+    WRef q_a;                // bf16 [1536, 4096]
     const void* q_a_norm;    // bf16 [1536]
-    const void* q_b;         // bf16 [16384, 1536]
-    const void* kv_a;        // bf16 [512, 4096]
+    WRef q_b;                // bf16 [16384, 1536]
+    WRef kv_a;               // bf16 [512, 4096]
     const void* kv_a_norm;   // bf16 [512]
     const void* kv_b;        // bf16 [32768, 512]  rows: h*512 + (0..255 = W_k, 256..511 = W_v)
-    const void* o_proj;      // bf16 [4096, 16384]
+    WRef o_proj;             // bf16 [4096, 16384]
     int dtype;
 };
 

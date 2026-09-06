@@ -23,6 +23,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <sys/stat.h>
+
 namespace glm5 {
 
 #define CU(x) do { cudaError_t e_=(x); if(e_){ fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__, \
@@ -49,15 +51,36 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
         for (int i = 0; i < cfg_.n_layer; ++i) pats += "layers." + std::to_string(i) + ".,";
         pats += "embed_tokens,lm_head,language_model.norm";
     }
-    ws_ = new st::WeightStore(cfg_.model_dir, nullptr, pats.empty() ? nullptr : pats.c_str());
+    // ROOFLINE §3: the NVFP4 dense-weight overlay. Present -> used, absent -> the engine runs
+    // exactly as it did before, on bf16. GLM5_DENSE_NVFP4=0 forces bf16 with the overlay resident,
+    // which is what makes an A/B a restart rather than a reload.
+    std::vector<std::string> overlays;
+    {
+        const char* off = getenv("GLM5_DENSE_NVFP4");
+        const char* od  = getenv("GLM5_NVFP4_OVERLAY");
+        std::string dir = od ? od : (cfg_.model_dir + "/../glm-5.3-flash-dense-nvfp4-overlay");
+        struct stat sb;
+        const bool have = (stat((dir + "/model.safetensors.index.json").c_str(), &sb) == 0);
+        nvfp4_dense_ = have && !(off && std::string(off) == "0");
+        if (nvfp4_dense_) overlays.push_back(dir);
+        else if (cfg_.verbose && have) printf("engine: dense NVFP4 overlay present but DISABLED\n");
+    }
+    ws_ = new st::WeightStore(cfg_.model_dir, nullptr, pats.empty() ? nullptr : pats.c_str(),
+                              overlays);
     resident_ = ws_->loadedGiB();
+    dprof_set_nvfp4_dense(nvfp4_dense_);
+    if (cfg_.verbose && nvfp4_dense_) printf("engine: dense NVFP4 overlay ACTIVE\n");
     if (cfg_.verbose)
         printf("engine: %zu tensors, %.2f GiB resident, %d layers, max_ctx %d\n",
                ws_->count(), resident_, cfg_.n_layer, cfg_.max_ctx);
 
     embed_      = ws_->get("model.language_model.embed_tokens.weight").dev;
     final_norm_ = ws_->get("model.language_model.norm.weight").dev;
-    lm_head_    = ws_->get("lm_head.weight").dev;
+    lm_head_ = (nvfp4_dense_ && ws_->has("lm_head.weight_packed"))
+                   ? WRef(ws_->dev<uint8_t>("lm_head.weight_packed"),
+                          ws_->dev<uint8_t>("lm_head.weight_scale"),
+                          ws_->dev<float>("lm_head.weight_global_scale"))
+                   : WRef(ws_->get("lm_head.weight").dev);
 
     L_.resize(cfg_.n_layer);
     std::vector<Nvfp4Mat> hostE(3 * N_ROUTED_EXPERT), hostS(3);
@@ -67,6 +90,18 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
         const std::string P = "model.language_model.layers." + std::to_string(i) + ".";
         auto D = [&](const std::string& s) { return ws_->get(P + s).dev; };
         auto F = [&](const std::string& s) { return ws_->dev<float>(P + s); };
+        // Prefer the NVFP4 overlay wherever it exists, fall back to bf16 where it does not.
+        // `stem` is the tensor name WITHOUT ".weight": the overlay stores the triple under it.
+        auto Q = [&](const std::string& stem) -> WRef {
+            const std::string b = P + stem;
+            if (nvfp4_dense_ && ws_->has(b + ".weight_packed"))
+                return WRef(ws_->dev<uint8_t>(b + ".weight_packed"),
+                            ws_->dev<uint8_t>(b + ".weight_scale"),
+                            ws_->dev<float>(b + ".weight_global_scale"));
+            // Not every tensor is named "<stem>.weight" — index_kpool_compress_gate is a bare
+            // parameter, and the overlay stores it under its own name.
+            return WRef(ws_->get(ws_->has(b + ".weight") ? b + ".weight" : b).dev);
+        };
 
         l.kda = is_kda(i);
         l.moe = is_moe(i);
@@ -85,41 +120,41 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
                                  "self_attn.v_conv1d.weight"};
             for (int j = 0; j < 3; ++j) f32_from_bf16_dev(cw + j * per, D(nm[j]), per, 0);
             l.kw.dtype   = GEMV_BF16;
-            l.kw.q_proj  = D("self_attn.q_proj.weight");
-            l.kw.k_proj  = D("self_attn.k_proj.weight");
-            l.kw.v_proj  = D("self_attn.v_proj.weight");
-            l.kw.o_proj  = D("self_attn.o_proj.weight");
+            l.kw.q_proj  = Q("self_attn.q_proj");
+            l.kw.k_proj  = Q("self_attn.k_proj");
+            l.kw.v_proj  = Q("self_attn.v_proj");
+            l.kw.o_proj  = Q("self_attn.o_proj");
             l.kw.conv1d  = cw;
-            l.kw.f_a     = D("self_attn.f_a_proj.weight");
-            l.kw.f_b     = D("self_attn.f_b_proj.weight");
+            l.kw.f_a     = Q("self_attn.f_a_proj");
+            l.kw.f_b     = Q("self_attn.f_b_proj");
             l.kw.dt_bias = F("self_attn.dt_bias");
             l.kw.A_log   = F("self_attn.A_log");
-            l.kw.b_proj  = D("self_attn.b_proj.weight");
-            l.kw.g_a     = D("self_attn.g_a_proj.weight");
-            l.kw.g_b     = D("self_attn.g_b_proj.weight");
+            l.kw.b_proj  = Q("self_attn.b_proj");
+            l.kw.g_a     = Q("self_attn.g_a_proj");
+            l.kw.g_b     = Q("self_attn.g_b_proj");
             l.kw.o_norm  = D("self_attn.o_norm.weight");
         } else {
             l.mla_slot = n_full_++;
             l.mw.dtype     = GEMV_BF16;
-            l.mw.q_a       = D("self_attn.q_a_proj.weight");
+            l.mw.q_a       = Q("self_attn.q_a_proj");
             l.mw.q_a_norm  = D("self_attn.q_a_layernorm.weight");
-            l.mw.q_b       = D("self_attn.q_b_proj.weight");
-            l.mw.kv_a      = D("self_attn.kv_a_proj_with_mqa.weight");
+            l.mw.q_b       = Q("self_attn.q_b_proj");
+            l.mw.kv_a      = Q("self_attn.kv_a_proj_with_mqa");
             l.mw.kv_a_norm = D("self_attn.kv_a_layernorm.weight");
             l.mw.kv_b      = D("self_attn.kv_b_proj.weight");
-            l.mw.o_proj    = D("self_attn.o_proj.weight");
+            l.mw.o_proj    = Q("self_attn.o_proj");
             l.iw.dtype         = GEMV_BF16;
-            l.iw.wq_b          = D("self_attn.indexer.wq_b.weight");
-            l.iw.wk            = D("self_attn.indexer.wk.weight");
+            l.iw.wq_b          = Q("self_attn.indexer.wq_b");
+            l.iw.wk            = Q("self_attn.indexer.wk");
             l.iw.k_norm_w      = D("self_attn.indexer.k_norm.weight");
             l.iw.k_norm_b      = D("self_attn.indexer.k_norm.bias");
-            l.iw.weights_proj  = D("self_attn.indexer.weights_proj.weight");
+            l.iw.weights_proj  = Q("self_attn.indexer.weights_proj");
             l.iw.compress_ape  = D("self_attn.indexer.index_kpool_compress_ape");
-            l.iw.compress_gate = D("self_attn.indexer.index_kpool_compress_gate");
+            l.iw.compress_gate = Q("self_attn.indexer.index_kpool_compress_gate");
         }
 
         if (!l.moe) {
-            l.dense = {D("mlp.gate_proj.weight"), D("mlp.up_proj.weight"), D("mlp.down_proj.weight"),
+            l.dense = {Q("mlp.gate_proj"), Q("mlp.up_proj"), Q("mlp.down_proj"),
                        DENSE_INTER, GEMV_BF16};
         } else {
             auto mat = [&](const std::string& b) {
@@ -265,9 +300,11 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
         if (tokens[m] < 0 || tokens[m] >= VOCAB) {
             fprintf(stderr, "engine: token %d out of range\n", tokens[m]); abort(); }
 
+    dprof_begin(DP_EMBED, s);
     for (int m = 0; m < M; ++m)
         k_embed_broadcast<<<(HIDDEN + 255) / 256, 256, 0, s>>>(
             b_streams_ + (size_t)m * HC_MULT * HIDDEN, (const __nv_bfloat16*)embed_, tokens[m]);
+    dprof_end(DP_EMBED, s);
 
     for (int i = 0; i < cfg_.n_layer; ++i) {
         LayerW& l = L_[i];
@@ -278,15 +315,21 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
         // hc runs per token: it is 0.4% of B_tok and its own Sinkhorn is per-token state, so
         // looping costs M x 786 KB per site (~2% of a 4-wide forward). Batching k_hc_mix would
         // remove that; it is not the largest term and has not been done yet.
-        for (int m = 0; m < M; ++m) {
+        dprof_begin(DP_HC_PRE_ATTN, s);
+        for (int m = 0; m < M; ++m)
             hc_compose(b_streams_ + (size_t)m * HC_MULT * HIDDEN, l.hc_attn,
                        b_coll_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
                        b_comb_ + (size_t)m * HC_MULT * HC_MULT,
                        b_hcws_ + (size_t)m * hc_workspace_floats(), s);
+        dprof_end(DP_HC_PRE_ATTN, s);
+        dprof_begin(DP_NORM_ATTN, s);
+        for (int m = 0; m < M; ++m)
             rmsnorm(b_normed_ + (size_t)m * HIDDEN, b_coll_ + (size_t)m * HIDDEN,
                     l.ln_in, GEMV_BF16, HIDDEN, s);
-        }
-        if (l.kda)
+        dprof_end(DP_NORM_ATTN, s);
+        dprof_begin(DP_ATTN, s);
+        if (l.kda) {
+            dprof_begin(DP_KDA, s);
             // Slot stride is the whole per-slot state, so layer l's slot m sits at
             // base + m*stride + l*per_layer. Stride 0 is the in-place autoregressive case.
             kda_batch_step_slots(b_normed_, l.kw,
@@ -295,30 +338,42 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
                            kda_state_ + (size_t)l.kda_slot * KDA_STATE_PER_LAYER,
                            snapshot ? (size_t)n_kda_ * KDA_STATE_PER_LAYER : 0,
                            b_sub_, b_ws_kda_, M, s);
-        else {
+            dprof_end(DP_KDA, s);
+        } else {
+            dprof_begin(DP_MLA, s);
             IndexerState IS = idxState(l.mla_slot);
             mla_batch_step_dsa(b_normed_, l.mw, l.iw, IS,
                                mla_cache_ + (size_t)l.mla_slot * cfg_.max_ctx * MLA_KV_LORA,
                                pos0, M, cfg_.max_ctx, idx_sel_, idx_n_, b_sub_, b_ws_mla_,
                                ws_idx_, s);
+            dprof_end(DP_MLA, s);
         }
+        dprof_end(DP_ATTN, s);
+        dprof_begin(DP_HC_POST_ATTN, s);
         for (int m = 0; m < M; ++m)
             hc_apply(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_resid_ + (size_t)m * HC_MULT * HIDDEN,
                      b_sub_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
                      b_comb_ + (size_t)m * HC_MULT * HC_MULT, s);
+        dprof_end(DP_HC_POST_ATTN, s);
 
         // ---- MLP site ----
         CU(cudaMemcpyAsync(b_resid_, b_streams_, (size_t)M * HC_MULT * HIDDEN * 4,
                            cudaMemcpyDeviceToDevice, s));
-        for (int m = 0; m < M; ++m) {
+        dprof_begin(DP_HC_PRE_FFN, s);
+        for (int m = 0; m < M; ++m)
             hc_compose(b_streams_ + (size_t)m * HC_MULT * HIDDEN, l.hc_ffn,
                        b_coll_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
                        b_comb_ + (size_t)m * HC_MULT * HC_MULT,
                        b_hcws_ + (size_t)m * hc_workspace_floats(), s);
+        dprof_end(DP_HC_PRE_FFN, s);
+        dprof_begin(DP_NORM_FFN, s);
+        for (int m = 0; m < M; ++m)
             rmsnorm(b_normed_ + (size_t)m * HIDDEN, b_coll_ + (size_t)m * HIDDEN,
                     l.ln_post, GEMV_BF16, HIDDEN, s);
-        }
+        dprof_end(DP_NORM_FFN, s);
+        dprof_begin(DP_FFN, s);
         if (l.moe) {
+            dprof_begin(DP_MOE, s);
             // THE ROUTED EXPERTS ARE NOT BATCHED, and that is a measured choice, not an omission.
             // At the widths speculation uses, K tokens select almost disjoint expert sets — 29.4
             // distinct of a possible 32 at K=4 — so batching them would save 4.7% (ROOFLINE §4).
@@ -327,23 +382,33 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
             for (int m = 0; m < M; ++m)
                 moe_forward(b_normed_ + (size_t)m * HIDDEN, l.ml, b_sub_ + (size_t)m * HIDDEN,
                             sel_, selw_, ws_moe_, s);
+            dprof_end(DP_MOE, s);
         } else {
+            dprof_begin(DP_DENSE, s);
             dense_mlp_batch(b_normed_, l.dense, b_sub_, b_ws_mlp_, M, s);
+            dprof_end(DP_DENSE, s);
         }
+        dprof_end(DP_FFN, s);
+        dprof_begin(DP_HC_POST_FFN, s);
         for (int m = 0; m < M; ++m)
             hc_apply(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_resid_ + (size_t)m * HC_MULT * HIDDEN,
                      b_sub_ + (size_t)m * HIDDEN, b_post_ + (size_t)m * HC_MULT,
                      b_comb_ + (size_t)m * HC_MULT * HC_MULT, s);
+        dprof_end(DP_HC_POST_FFN, s);
     }
 
     if (!logits) return;
     const int first = all_logits ? 0 : M - 1;
+    dprof_begin(DP_HEAD_MEAN, s);
     for (int m = first; m < M; ++m) {
         hc_head_mean(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_pooled_ + (size_t)m * HIDDEN, s);
         rmsnorm(b_pooled_ + (size_t)m * HIDDEN, b_pooled_ + (size_t)m * HIDDEN,
                 final_norm_, GEMV_BF16, HIDDEN, s);
     }
+    dprof_end(DP_HEAD_MEAN, s);
+    dprof_begin(DP_LM_HEAD, s);
     gemm(logits, lm_head_, b_pooled_ + (size_t)first * HIDDEN, M - first, VOCAB, HIDDEN, GEMV_BF16, s);
+    dprof_end(DP_LM_HEAD, s);
 }
 
 void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
@@ -437,7 +502,7 @@ int Engine::prefill(const std::vector<int>& ids, float* logits_out) {
         throw std::runtime_error("prefill: context " + std::to_string(start + ids.size()) +
                                  " exceeds max_ctx " + std::to_string(cfg_.max_ctx));
     const int N = (int)ids.size();
-    const int C = cfg_.max_batch < 1 ? 1 : cfg_.max_batch;
+    const int C = chunk_ > 0 ? chunk_ : (cfg_.max_batch < 1 ? 1 : cfg_.max_batch);
     for (int off = 0; off < N; off += C) {
         const int m = std::min(C, N - off);
         const bool last = (off + m == N);

@@ -21,7 +21,20 @@ struct DevTensor { const void* dev = nullptr; std::string dtype; std::vector<int
 class WeightStore {
 public:
     WeightStore(const std::string& dir, std::string (*key_map)(const std::string&) = nullptr,
-                const char* only_prefix = nullptr) {
+                const char* only_prefix = nullptr,
+                const std::vector<std::string>& overlays = {}) {
+        load(dir, key_map, only_prefix);
+        // Overlay directories are loaded ON TOP, and their tensors win on a name collision. This
+        // is how ROOFLINE §3's NVFP4 dense weights arrive without rewriting a 98 GiB checkpoint:
+        // the overlay carries only `<stem>.weight_packed/_scale/_global_scale`, which do not
+        // collide with anything, and the engine prefers them wherever they exist. Emitting a
+        // family or not IS the gate.
+        for (const auto& o : overlays) load(o, key_map, only_prefix);
+    }
+
+private:
+    void load(const std::string& dir, std::string (*key_map)(const std::string&),
+              const char* only_prefix) {
         ShardedSafeTensors S(dir, key_map, only_prefix);
         // 1. load each shard's data blob via pread (single copy, no mmap fault).
         //
@@ -47,6 +60,13 @@ public:
         const bool want_managed = [](){ const char* e=getenv("DSV4_WEIGHTS");
                                         return !(e && std::string(e)=="mapped"); }();
         int dev_id = 0; cudaGetDevice(&dev_id);
+        // LOCAL, not members. These map an mmap address range to its device blob, and the mmaps
+        // die with `S` at the end of this call — so a second load() (an overlay) gets its own
+        // mmaps AT THE SAME ADDRESSES, and a retained map would resolve the overlay's tensors
+        // against the base checkpoint's blobs. That reads garbage, silently: gate_stack came back
+        // at cos 0.0005 with activations of 4e21 while every kernel gate still passed.
+        std::unordered_map<const SafeTensors*, const uint8_t*> host_base_;
+        std::unordered_map<const SafeTensors*, void*> dev_base_;
         std::unordered_map<const SafeTensors*, void*> base;   // shard -> device-accessible base
         for (auto& kv : S.shards()) {
             SafeTensors* sh = kv.second.get(); size_t nb = sh->dataBytes();
@@ -88,9 +108,11 @@ public:
             if (!owner) throw std::runtime_error("tensor not in any shard: " + kv.first);
             size_t offset = (size_t)(t.data - host_base_[owner]);
             DevTensor d; d.dev = (const uint8_t*)dev_base_[owner] + offset; d.dtype = t.dtype; d.shape = t.shape; d.nbytes = t.nbytes;
-            t_.emplace(kv.first, std::move(d));
+            t_[kv.first] = std::move(d);          // overlay wins on collision
         }
     }
+
+public:
     ~WeightStore() { for (void* p : pinned_) cudaFreeHost(p); for (void* p : managed_) cudaFree(p); }
     bool managed() const { return managed_any_; }
 
@@ -103,8 +125,6 @@ public:
 
 private:
     std::unordered_map<std::string, DevTensor> t_;
-    std::unordered_map<const SafeTensors*, const uint8_t*> host_base_;
-    std::unordered_map<const SafeTensors*, void*> dev_base_;
     std::vector<void*> pinned_;
     std::vector<void*> managed_;
     bool managed_any_ = false;

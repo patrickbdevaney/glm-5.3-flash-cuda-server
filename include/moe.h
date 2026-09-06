@@ -2,6 +2,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "gemv.h"
 
 namespace glm5 {
 
@@ -16,7 +17,7 @@ struct Nvfp4Mat {
 };
 
 struct MoeLayer {
-    const void*  router_w;      // bf16 [E, HIDDEN]
+    WRef         router_w;      // bf16 [E, HIDDEN]
     const float* router_bias;   // fp32 [E]  e_score_correction_bias
     const Nvfp4Mat* experts;    // device array, 3*E entries: [e*3+0]=gate, +1=up, +2=down
     const Nvfp4Mat* shared;     // device array, 3 entries: gate, up, down

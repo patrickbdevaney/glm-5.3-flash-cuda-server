@@ -29,17 +29,18 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "glm5_config.h"
+#include "gemv.h"
 
 namespace glm5 {
 
 struct IndexerWeights {
-    const void*  wq_b;           // [IDX_HEADS*IDX_HEAD_DIM, MLA_Q_LORA]
-    const void*  wk;             // [IDX_HEAD_DIM, HIDDEN]
+    WRef         wq_b;           // [IDX_HEADS*IDX_HEAD_DIM, MLA_Q_LORA]
+    WRef         wk;             // [IDX_HEAD_DIM, HIDDEN]
     const void*  k_norm_w;       // [IDX_HEAD_DIM]
     const void*  k_norm_b;       // [IDX_HEAD_DIM]
-    const void*  weights_proj;   // [IDX_HEADS, HIDDEN]
+    WRef         weights_proj;   // [IDX_HEADS, HIDDEN]
     const void*  compress_ape;   // [IDX_KPOOL, IDX_HEAD_DIM]
-    const void*  compress_gate;  // [IDX_HEAD_DIM, HIDDEN]
+    WRef         compress_gate;  // [IDX_HEAD_DIM, HIDDEN]
     int dtype;                   // GEMV_F32 (gate) or GEMV_BF16 (production)
 };
 

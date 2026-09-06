@@ -65,6 +65,10 @@ public:
     // last token in `logits_out` (host, VOCAB floats) if non-null.
     int prefill(const std::vector<int>& ids, float* logits_out = nullptr);
 
+    // Prefill chunk width. Defaults to max_batch; settable so a bench can sweep it without a
+    // reload, which is what makes a round-robin sweep possible at all on a 100 GiB model.
+    void setChunk(int c) { chunk_ = c < 1 ? 1 : (c > cfg_.max_batch ? cfg_.max_batch : c); }
+
     // M tokens in ONE forward, at positions pos0 .. pos0+M-1.
     //
     // This is the kernel the whole repo turns on. Weights are read ONCE for all M — a K-wide
@@ -125,11 +129,13 @@ private:
 
     EngineConfig cfg_;
     st::WeightStore* ws_ = nullptr;
+    int chunk_ = 0;              // 0 = use cfg_.max_batch
     std::vector<LayerW> L_;
 
     const void* embed_ = nullptr;
     const void* final_norm_ = nullptr;
-    const void* lm_head_ = nullptr;
+    WRef lm_head_{};
+    bool nvfp4_dense_ = false;   // ROOFLINE §3 overlay is loaded and in use
 
     // activations
     float* streams_ = nullptr;    // [HC_MULT, HIDDEN]

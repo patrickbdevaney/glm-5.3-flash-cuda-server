@@ -53,6 +53,11 @@ int main(int argc, char** argv) {
     ec.model_dir = std::string(getenv("HOME")) + "/glm-5.3-reap/output/glm-5.3-flash-reap50-nvfp4-pass2";
     ec.n_layer = N_LAYER; ec.max_ctx = 512; ec.max_batch = 1;
     int steps = 24, warm = 6;
+    // B_tok is a property of WHICH weights the engine ended up binding, so it cannot be a
+    // constant here: the ROOFLINE §3 overlay takes it from 19.761 G to 9.762 G. Passed in rather
+    // than inferred, so that a run always says out loud which byte model it priced itself against.
+    double btok = getenv("GLM5_DENSE_NVFP4") && std::string(getenv("GLM5_DENSE_NVFP4")) == "0"
+                      ? 19.761 : 9.762;   // ROOFLINE §3 overlay: -50.6%, measured off the shards
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]{ return std::string(argv[++i]); };
@@ -60,6 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "--n-layer") ec.n_layer   = atoi(next().c_str());
         else if (a == "--steps")   steps        = atoi(next().c_str());
         else if (a == "--seqmax")  ec.max_ctx   = atoi(next().c_str());
+        else if (a == "--btok")    btok         = atof(next().c_str());
     }
     setenv("GLM5_DPROF", "1", 1);                       // this tool exists to profile; always on
     dprof_init();
@@ -87,8 +93,8 @@ int main(int argc, char** argv) {
 
     printf("\nwall: %.2f ms for %d steps = %.2f ms/tok = %.2f tok/s\n",
            ms, steps, ms / steps, 1000.0 * steps / ms);
-    printf("roofline at %.1f GB/s with B_tok 19.761 G: %.2f tok/s  ->  we are at %.0f%%\n",
-           bw, bw / 19.761, 100.0 * (1000.0 * steps / ms) / (bw / 19.761));
+    printf("roofline at %.1f GB/s with B_tok %.3f G: %.2f tok/s  ->  we are at %.0f%%\n",
+           bw, btok, bw / btok, 100.0 * (1000.0 * steps / ms) / (bw / btok));
     dprof_report("AR decode", steps, bw);
     return 0;
 }

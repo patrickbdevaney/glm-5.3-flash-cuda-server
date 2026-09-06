@@ -19,6 +19,8 @@ done
 # the indexer needs no engine and no checkpoint shards: its oracle dumps its own inputs
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_indexer.cu kernels/indexer.cu kernels/gemv.cu \
      -o build/gate_indexer && echo "built build/gate_indexer"
+nvcc -O2 -std=c++17 $ARCH -I include tests/gate_nvfp4.cu kernels/gemv.cu \
+     -o build/gate_nvfp4 && echo "built build/gate_nvfp4"
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_mla_sparse.cu $K \
      -o build/gate_mla_sparse && echo "built build/gate_mla_sparse"
 # gates that drive the whole engine
@@ -31,6 +33,7 @@ done
 nvcc -O2 -std=c++17 $ARCH -I include tools/bw_probe.cu -o build/bw_probe && echo "built build/bw_probe"
 nvcc -O2 -std=c++17 $ARCH -I include tools/bench_batch.cu $E -o build/bench_batch && echo "built build/bench_batch"
 nvcc -O2 -std=c++17 $ARCH -I include tools/bench_decode.cu $E -o build/bench_decode && echo "built build/bench_decode"
+nvcc -O2 -std=c++17 $ARCH -I include tools/bench_prefill.cu $E -o build/bench_prefill && echo "built build/bench_prefill"
 
 # The server. -pthread for httplib's thread pool; the UI, API shaping and tokenizer are all headers.
 nvcc -O2 -std=c++17 $ARCH -I include -Xcompiler -pthread \

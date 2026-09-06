@@ -37,7 +37,7 @@ static const char* kName[DP_N] = {
 // The split of the 9.366 G KDA bucket across its six sub-phases follows the tensor shapes:
 // q/k/v_proj are three bf16 [8192,4096] (67.1 MB each) and land in qkv+conv, o_proj is the fourth,
 // and the low-rank gate projections are the 0.5 G remainder. The recurrence is state, not weights.
-static const double kBytes[DP_N] = {
+static double kBytes[DP_N] = {
     /* hc:pre_attn   */ 0.0355e9, /* norm:attn */ 0.0, /* ATTENTION */ 11.950e9, /* hc:post_attn */ 0.0,
     /* hc:pre_ffn    */ 0.0355e9, /* norm:ffn  */ 0.0, /* FFN       */  6.307e9, /* hc:post_ffn  */ 0.0,
     /* embed         */ 0.0, /* head:mean */ 0.0, /* lm_head */ 1.269e9,
@@ -53,6 +53,29 @@ static const double kBytes[DP_N] = {
     /* ffn:moe       */ 5.401e9, /* ffn:dense */ 0.906e9,
     /* moe:router    */ 0.050e9, /* moe:w13+act */ 3.568e9, /* moe:w2+combine */ 1.783e9,
 };
+
+// When the ROOFLINE §3 overlay is bound, the dense weights on the AR path are 0.5625 B/weight
+// instead of 2.0 and every row above that counts them is wrong by 3.56x. Leaving them wrong is
+// not a cosmetic problem: the report would print kda:qkv+conv at 158% of bandwidth, and the rule
+// this file is built around is that a row over 100% is a WRONG BYTE COUNT, never a fast kernel.
+//
+// Only the converted families scale. kda:recurrence is state; ffn:moe was already NVFP4; the
+// hyper-connection `fn` tensors and MLA's kv_b are still bf16 because neither is read through
+// gemv, so mla keeps a bf16 share (kv_b is 33.6 of its 249.8 MB per layer).
+void dprof_set_nvfp4_dense(bool on) {
+    if (!on) return;
+    const double q = 0.5625 / 2.0;
+    kBytes[DP_K_QKVCONV] = 6.850e9 * q;
+    kBytes[DP_K_GATES]   = 0.500e9 * q;
+    kBytes[DP_K_OPROJ]   = 2.283e9 * q;
+    kBytes[DP_KDA]       = kBytes[DP_K_QKVCONV] + kBytes[DP_K_GATES] + kBytes[DP_K_OPROJ]
+                         + kBytes[DP_K_RECUR];
+    kBytes[DP_MLA]       = 2.584e9 * ((216.2 * q + 33.55) / 249.8);
+    kBytes[DP_LM_HEAD]   = 1.269e9 * q;
+    kBytes[DP_DENSE]     = 0.906e9 * q;
+    kBytes[DP_ATTN]      = kBytes[DP_KDA] + kBytes[DP_MLA];
+    kBytes[DP_FFN]       = kBytes[DP_MOE] + kBytes[DP_DENSE];
+}
 
 void dprof_init(int max_marks){
     if (g_inited) return;

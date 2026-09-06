@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include "gemv.h"
 
 namespace glm5 {
 
@@ -12,18 +13,18 @@ namespace glm5 {
 // `conv_state` [3*QKV][KDA_CONV_STATE] and `S` [H][Dk][Dv] are updated IN PLACE.
 struct KdaWeights {
     // Stored exactly as the checkpoint stores them (row-major [out, in]).
-    const void* q_proj;    // [QKV, HIDDEN]
-    const void* k_proj;    // [QKV, HIDDEN]
-    const void* v_proj;    // [QKV, HIDDEN]
-    const void* o_proj;    // [HIDDEN, QKV]
+    WRef q_proj;           // [QKV, HIDDEN]
+    WRef k_proj;           // [QKV, HIDDEN]
+    WRef v_proj;           // [QKV, HIDDEN]
+    WRef o_proj;           // [HIDDEN, QKV]
     const void* conv1d;    // [3*QKV, 4]  -- q,k,v conv weights concatenated in that order
-    const void* f_a;       // [GATE_RANK, HIDDEN]
-    const void* f_b;       // [QKV, GATE_RANK]
+    WRef f_a;              // [GATE_RANK, HIDDEN]
+    WRef f_b;              // [QKV, GATE_RANK]
     const float* dt_bias;  // [QKV]
     const float* A_log;    // [H]
-    const void* b_proj;    // [H, HIDDEN]
-    const void* g_a;       // [GATE_RANK, HIDDEN]
-    const void* g_b;       // [QKV, GATE_RANK]
+    WRef b_proj;           // [H, HIDDEN]
+    WRef g_a;              // [GATE_RANK, HIDDEN]
+    WRef g_b;              // [QKV, GATE_RANK]
     const void* o_norm;    // [Dv]
     int dtype;             // 0 = fp32 (oracle/gate), 1 = bf16 (production)
 };

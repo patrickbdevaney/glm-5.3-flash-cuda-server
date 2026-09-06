@@ -174,15 +174,15 @@ int main(int argc, char** argv) {
     auto mk_bf16 = [&](const void* f32, size_t n) -> void* {
         void* d; CU(cudaMalloc(&d, n * 2)); f32_to_bf16(d, (const float*)f32, n, 0); return d;
     };
-    B.q_proj = mk_bf16(W.q_proj, (size_t)Qd * HIDDEN);
-    B.k_proj = mk_bf16(W.k_proj, (size_t)Qd * HIDDEN);
-    B.v_proj = mk_bf16(W.v_proj, (size_t)Qd * HIDDEN);
-    B.o_proj = mk_bf16(W.o_proj, (size_t)HIDDEN * Qd);
-    B.f_a    = mk_bf16(W.f_a, (size_t)KDA_GATE_RANK * HIDDEN);
-    B.f_b    = mk_bf16(W.f_b, (size_t)Qd * KDA_GATE_RANK);
-    B.g_a    = mk_bf16(W.g_a, (size_t)KDA_GATE_RANK * HIDDEN);
-    B.g_b    = mk_bf16(W.g_b, (size_t)Qd * KDA_GATE_RANK);
-    B.b_proj = mk_bf16(W.b_proj, (size_t)Hh * HIDDEN);
+    B.q_proj = mk_bf16(W.q_proj.p, (size_t)Qd * HIDDEN);
+    B.k_proj = mk_bf16(W.k_proj.p, (size_t)Qd * HIDDEN);
+    B.v_proj = mk_bf16(W.v_proj.p, (size_t)Qd * HIDDEN);
+    B.o_proj = mk_bf16(W.o_proj.p, (size_t)HIDDEN * Qd);
+    B.f_a    = mk_bf16(W.f_a.p, (size_t)KDA_GATE_RANK * HIDDEN);
+    B.f_b    = mk_bf16(W.f_b.p, (size_t)Qd * KDA_GATE_RANK);
+    B.g_a    = mk_bf16(W.g_a.p, (size_t)KDA_GATE_RANK * HIDDEN);
+    B.g_b    = mk_bf16(W.g_b.p, (size_t)Qd * KDA_GATE_RANK);
+    B.b_proj = mk_bf16(W.b_proj.p, (size_t)Hh * HIDDEN);
     B.o_norm = mk_bf16(W.o_norm, (size_t)D);
     // conv1d stays fp32: it is [24576, 4], 393 KB, and k_conv_silu reads it as fp32 by design.
     CU(cudaDeviceSynchronize());

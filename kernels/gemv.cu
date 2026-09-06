@@ -18,7 +18,20 @@
 // dies on real weights. gemv() therefore measures alignment at launch and dispatches to a scalar
 // variant when the vector path would be illegal - never assumes.
 #include "gemv.h"
+#include "nvfp4.cuh"
+#ifndef FP4_PROBE
+#define FP4_PROBE 0
+#endif
+// Rows per block, MEASURED not reasoned (tools/bench_gemv sweeps it). 5 is the peak on this box
+// and it is a sharp one: 2->115, 3->135, 4->150, 5->161, 6->135, 8->132, 16->100, 32->75 GB/s on
+// the KDA projection. Too few rows and x traffic dominates again; too many and acc[R][MB] plus
+// the staged x push the block off a register cliff.
+#ifndef NVFP4_R
+#define NVFP4_R 5
+#endif
 #include <cuda_bf16.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 
 namespace glm5 {
@@ -169,6 +182,174 @@ static inline bool vec16_ok(const void* p, int K, int elem_bytes) {
 // decode -- which gate_batch asserts and speculative verification depends on.
 static inline int gemv_bs(int K) { return K <= 128 ? 32 : K <= 512 ? 64 : 256; }
 
+// ---- NVFP4 ---------------------------------------------------------------------------------
+//
+// ROOFLINE §3's lever: 13.91 GiB of bf16 dense weights on the AR path become 3.91 GiB here.
+//
+// TWO EARLIER VERSIONS OF THIS KERNEL WERE WRONG, AND BOTH WERE WRONG ABOUT THE SAME THING.
+// The first read one uint32 per iteration and took its scale through the MoE's shared LUT: it
+// removed 50.6% of B_tok and bought 1.4% (8.36 -> 8.48 tok/s). The second read uint4 and used the
+// hardware e4m3 converter, and was 3.4x SLOWER still. Stubbing the inner loop one term at a time
+// (tools/bench_gemv, -DFP4_PROBE) settled it in one run:
+//
+//   stub the FP4 unpack   -> 17.1 GB/s   (no change; cvt.rn.f16x2.e2m1x2 is free)
+//   stub the e4m3 scale   -> 17.1 GB/s   (no change)
+//   stub the x reads      -> 323.7 GB/s  (19x)
+//
+// THE ACTIVATIONS ARE THE COST, NOT THE WEIGHTS. A gemv reads 4 bytes of x per weight. Against
+// bf16 that is 2 bytes of x per byte of weight; against NVFP4 it is 7.1. bf16 sustains ~420 GB/s
+// of x out of L2 and sits at 88-96% of streaming DRAM — it is at the right wall. NVFP4 asking for
+// 1.7 TB/s of x to reach the same weight bandwidth is not, and no amount of unpack cleverness
+// changes it. Halving the weight bytes cannot help while x is 7x the weight traffic.
+//
+// So the kernel reuses x. Each block owns R output ROWS and reads x ONCE for all of them, which
+// divides activation traffic by R: at R=8 it is 0.5 bytes per weight, back under the weights
+// themselves, and the kernel is bandwidth-bound on the thing that was actually removed.
+//
+// Granularity is uint32, deliberately, NOT the uint4 that looked wider. The packed layout ties
+// 16 contiguous bytes to 32 contiguous weights, so a uint4 makes lane t read x[32t..32t+31] — at
+// a fixed offset the warp's 32 lanes then touch 32 DIFFERENT 128-byte lines and use 4 bytes of
+// each. uint32 gives x[8t..8t+7], the same stride the bf16 kernel uses, and the warp covers one
+// contiguous 1 KB span.
+//
+// ONE kernel serves both gemv and gemm. The bf16 path has separate ones and pays for it with a
+// standing obligation to keep two reduction trees in step; here `gemv` is literally
+// k_gemm_nvfp4<BS, 1, R>, so forward_batch at M=1 being bit-identical to decode is structural
+// rather than a property that has to be re-argued after every edit. gate_batch still checks it.
+
+template <int BS, int MB, int R>
+__global__ void k_gemm_nvfp4(float* __restrict__ y, const uint8_t* __restrict__ P,
+                             const uint8_t* __restrict__ Sc, const float* __restrict__ gs,
+                             const float* __restrict__ x, int N, int K) {
+    const int n0 = blockIdx.x * R;
+    const int K8 = K >> 3;                      // one uint32 = 8 weights
+    const size_t prow = (size_t)K >> 1, srow = (size_t)K >> 4;
+
+    float acc[R][MB];
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) acc[r][m] = 0.f;
+
+    const int rows = (N - n0) < R ? (N - n0) : R;      // last group may be short
+    for (int i = threadIdx.x; i < K8; i += BS) {
+        // x once, reused by all R rows. This load is the whole point of the kernel.
+        float xr[MB][8];
+        #pragma unroll
+        for (int m = 0; m < MB; ++m)
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+#if FP4_PROBE == 3                      // stub the x reads -- this is the term that mattered
+                xr[m][j] = 1.f;
+#else
+                xr[m][j] = x[(size_t)m * K + ((size_t)i << 3) + j];
+#endif
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r >= rows) break;
+            const unsigned pv =
+                reinterpret_cast<const unsigned*>(P + (size_t)(n0 + r) * prow)[i];
+#if FP4_PROBE == 2                      // stub the e4m3 scale converter
+            const float sc = (float)Sc[(size_t)(n0 + r) * srow + (i >> 1)];
+#else
+            const float sc = fp8e4m3(Sc[(size_t)(n0 + r) * srow + (i >> 1)]);
+#endif
+            float w[8];
+#if FP4_PROBE == 1                      // stub the e2m1 unpack
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) w[j] = (float)((pv >> j) & 1);
+#else
+            e2m1x8(w, pv);
+#endif
+            #pragma unroll
+            for (int m = 0; m < MB; ++m) {
+                float t = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) t = fmaf(w[j], xr[m][j], t);
+                acc[r][m] = fmaf(t, sc, acc[r][m]);
+            }
+        }
+    }
+
+    // The global scale is a per-tensor constant, so it comes out of the loop and applies once.
+    const float ig = 1.f / gs[0];
+    __shared__ float red[BS / 32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r >= rows) break;
+        #pragma unroll
+        for (int m = 0; m < MB; ++m) {
+            float a = acc[r][m];
+            for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+            if (lane == 0) red[warp] = a;
+            __syncthreads();
+            if (warp == 0) {
+                a = (lane < BS / 32) ? red[lane] : 0.f;
+                for (int o = 16; o; o >>= 1) a += __shfl_down_sync(0xffffffff, a, o);
+                if (lane == 0) y[(size_t)m * N + n0 + r] = a * ig;
+            }
+            __syncthreads();                    // red[] is reused by the next (r, m)
+        }
+    }
+}
+
+// Rows per block. x traffic per weight is 4*MB/R bytes, so R has to grow with MB to hold it
+// under the 0.5625 bytes the weights themselves cost — but acc[R][MB] and xr[MB][8] both live in
+// registers, so R*MB is the budget and 8 is where it lands.
+template <int MB> struct Rows { static constexpr int v = MB <= 1 ? NVFP4_R : MB <= 4 ? 4 : 2; };
+
+#define NVFP4_LAUNCH_BS(BS, MB)                                                        \
+    k_gemm_nvfp4<BS, MB, Rows<MB>::v><<<(N + Rows<MB>::v - 1) / Rows<MB>::v, BS, 0, s>>>( \
+        yc, W.packed, W.scale, W.gscale, xc, N, K)
+// Block size for the NVFP4 path, which has its own work granularity: the loop trip count is
+// K/8, not K/4 or K/8-of-a-float4, so gemv_bs()'s thresholds leave threads idle on the narrow
+// shapes (K=1536 gave 192 units of work to 256 threads). gemv and gemm both come through
+// gemm_nvfp4, so they cannot disagree with each other — which is the invariant that matters.
+static inline int nvfp4_bs(int K) {
+    const int units = K >> 3;
+    return units <= 128 ? 32 : units <= 256 ? 64 : units <= 1024 ? 128 : 256;
+}
+
+#define NVFP4_LAUNCH(MB)                                     \
+    do {                                                     \
+        switch (nvfp4_bs(K)) {                               \
+            case 32:  NVFP4_LAUNCH_BS(32,  MB); break;       \
+            case 64:  NVFP4_LAUNCH_BS(64,  MB); break;       \
+            case 128: NVFP4_LAUNCH_BS(128, MB); break;       \
+            default:  NVFP4_LAUNCH_BS(256, MB); break;       \
+        }                                                    \
+    } while (0)
+
+static void gemm_nvfp4(float* y, const WRef& W, const float* x, int M, int N, int K,
+                       cudaStream_t s) {
+    // K must be a multiple of 16 (the NVFP4 group). tools/requant_dense_nvfp4.py refuses to emit
+    // anything else, so a violation here means the overlay and the engine disagree about a shape.
+    if (K & 15) { fprintf(stderr, "gemm_nvfp4: K=%d is not a multiple of 16\n", K); abort(); }
+    int done = 0;
+    while (done < M) {
+        const int rem = M - done;
+        const int c = rem >= 32 ? 32 : rem >= 16 ? 16 : rem >= 8 ? 8 : rem;
+        float* yc = y + (size_t)done * N;
+        const float* xc = x + (size_t)done * K;
+        switch (c) {
+            case 1:  NVFP4_LAUNCH(1);  break;
+            case 2:  NVFP4_LAUNCH(2);  break;
+            case 3:  NVFP4_LAUNCH(3);  break;
+            case 4:  NVFP4_LAUNCH(4);  break;
+            case 5:  NVFP4_LAUNCH(5);  break;
+            case 6:  NVFP4_LAUNCH(6);  break;
+            case 7:  NVFP4_LAUNCH(7);  break;
+            case 8:  NVFP4_LAUNCH(8);  break;
+            case 16: NVFP4_LAUNCH(16); break;
+            default: NVFP4_LAUNCH(32); break;
+        }
+        done += c;
+    }
+}
+#undef NVFP4_LAUNCH
+#undef NVFP4_LAUNCH_BS
+
 #define GEMV_LAUNCH(BS)                                                                          \
     do {                                                                                         \
         if (dtype == GEMV_F32) {                                                                 \
@@ -181,7 +362,9 @@ static inline int gemv_bs(int K) { return K <= 128 ? 32 : K <= 512 ? 64 : 256; }
         }                                                                                        \
     } while (0)
 
-void gemv(float* y, const void* W, const float* x, int N, int K, int dtype, cudaStream_t s) {
+void gemv(float* y, const WRef& Wr, const float* x, int N, int K, int dtype, cudaStream_t s) {
+    if (Wr.nvfp4()) { gemm(y, Wr, x, 1, N, K, dtype, s); return; }
+    const void* W = Wr.p;
     switch (gemv_bs(K)) {
         case 32:  GEMV_LAUNCH(32);  break;
         case 64:  GEMV_LAUNCH(64);  break;
@@ -392,7 +575,9 @@ __global__ void k_gemm_bf16_scalar(float* __restrict__ y, const __nv_bfloat16* _
         }                                                  \
     } while (0)
 
-void gemm(float* y, const void* W, const float* x, int M, int N, int K, int dtype, cudaStream_t s) {
+void gemm(float* y, const WRef& Wr, const float* x, int M, int N, int K, int dtype, cudaStream_t s) {
+    if (Wr.nvfp4()) { gemm_nvfp4(y, Wr, x, M, N, K, s); return; }
+    const void* W = Wr.p;
     const bool vok = vec16_ok(W, K, dtype == GEMV_F32 ? 4 : 2);
     int done = 0;
     while (done < M) {

@@ -46,6 +46,10 @@ enum DProfId {
 extern bool g_dprof_on;
 
 void dprof_init(int max_marks = 65536);
+
+// Rescale the byte model for the ROOFLINE §3 NVFP4 dense overlay. The engine calls this at load
+// time; without it every AR-path row is priced against weights the engine is no longer reading.
+void dprof_set_nvfp4_dense(bool on);
 void dprof_begin(int id, cudaStream_t s = 0);
 void dprof_end(int id, cudaStream_t s = 0);
 void dprof_reset();

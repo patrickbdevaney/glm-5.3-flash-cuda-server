@@ -30,7 +30,7 @@ void hc_head_mean(const float* streams, float* out, cudaStream_t s);
 void rmsnorm(float* y, const float* x, const void* w, int dtype, int n, cudaStream_t s);
 
 // Dense MLP (layers 0..2): clamped SwiGLU, bf16 weights.
-struct DenseMlp { const void* gate; const void* up; const void* down; int inter; int dtype; };
+struct DenseMlp { WRef gate; WRef up; WRef down; int inter; int dtype; };
 void dense_mlp(const float* x, const DenseMlp& M, float* y, float* ws, cudaStream_t s);
 // x, y are [B, HIDDEN]. ws must be 2*B*inter floats.
 void dense_mlp_batch(const float* x, const DenseMlp& M, float* y, float* ws, int B, cudaStream_t s);
