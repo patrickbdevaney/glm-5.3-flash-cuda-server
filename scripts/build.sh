@@ -3,6 +3,13 @@
 # is: a kernel that is not gated against transformers on real weights is not finished (CLAUDE.md §2).
 set -e; cd "$(dirname "$0")/.."
 mkdir -p build
+
+# A FAILED BUILD MUST NOT LEAVE A RUNNABLE BINARY. `set -e` stops at the first error, but every
+# target compiled before it still sits in build/ from the previous run, and scripts/gate.sh will
+# happily run those and report all green -- which is the "gate that passes against a dead engine"
+# that CLAUDE.md §2 names as worse than no gate. It happened: a compile error in kernels/mla.cu
+# left gate_mla, gate_mla_sparse and gate_batch at their previous revision and all three passed.
+rm -f build/gate_* build/bench_* build/bw_probe build/glm5-server
 ARCH="-gencode arch=compute_110a,code=sm_110a"
 K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu kernels/indexer.cu kernels/dprof.cu"
 E="src/engine.cu $K"

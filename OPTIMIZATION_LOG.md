@@ -788,3 +788,95 @@ Converting `kv_b` to NVFP4 is still worth 3.55x on what `absorb_q`/`expand_v` re
 now 0.6% and 5.3% of prefill respectively, so it buys far less than it would have before this
 change. It has moved from "next" to "probably not worth a second kernel" — the honest reversal of
 what #13 predicted, in the direction that matters.
+
+---
+
+## 15. `k_context`: 5.2x, and two ways a benchmark lied on the way there
+
+After #14, `mla:sdpa` was the largest MLA row and the only cost in the engine that GROWS WITH
+CONTEXT — everything else costs the same at token 100 and token 3000. New level-3 dprof marks
+(`sdpa:scores` / `sdpa:softmax` / `sdpa:context`) put the mass squarely in one kernel:
+
+    mla:sdpa      39868 ms   17.0% of prefill      (prompt 2048, width 32)
+      sdpa:scores  5770
+      sdpa:softmax  364
+      sdpa:context 30420      76% of sdpa, 13.1% of the whole prefill
+
+At 256-token prompts sdpa is only 5.7% of prefill, so the earlier profile understated this badly.
+**Sizing a context-dependent lever at one context length is how it stays invisible.**
+
+### The two knobs
+
+`k_context` launched `Hh/HG = 4` blocks. Two ways to get more:
+
+- **HG (heads per block).** Lowering it multiplies blocks AND cache re-reads by the same factor.
+- **NT (t-tiles), new.** Each tile owns a DISJOINT slice of the latent cache, so NT tiles read the
+  cache once between them. Parallelism at no extra traffic, paid for with a partial buffer and a
+  reduce pass. NT is compile-time and `grid.y` is always NT, tiles past the end writing zeros, so
+  the dense and sparse twins partition `t` identically and stay bit-exact against each other
+  (`gate_mla_sparse`).
+
+### The result inverts the obvious model
+
+`tools/bench_context.cu` sweeps the grid on the REAL kernels (extracted to `include/mla_context.cuh`
+so the bench cannot drift from what ships). At n_tok=2048:
+
+| HG/NT | blocks | cache reads | min us | GB/s |
+|---|---|---|---|---|
+| 16/1 (shipped) | 4 | 4 | 1012.2 | 16.8 |
+| 16/16 | 64 | 4 | 260.2 | 80.6 |
+| 8/8 | 64 | 8 | 173.9 | 205.0 |
+| 4/1 | 16 | 16 | 162.2 | 415.4 |
+| **4/16** | 256 | 16 | **116.8** | 610.3 |
+| 2/16 | 512 | 32 | 157.7 | 877.7 |
+| 1/4 | 256 | 64 | 208.9 | 1290.2 |
+
+**HG=4 reads the cache 16 times per call and beats HG=16, which reads it 4 times, by 6.5x.** At
+equal block count (64), HG=4/NT=4 is 1.8x faster than HG=16/NT=16. So cache re-reads were never
+the constraint: the latent cache is L2-resident at these sizes — the winning point runs at
+610 GB/s against a 237 GB/s streaming read — and the binding constraint is per-SM occupancy, which
+`acc[HG]` destroys. Below HG=4 the traffic finally does bite: HG=1 saturates L2 at ~1290 GB/s.
+
+This is the opposite of #11, #12 and #14, where widening the consumer to cut weight traffic was
+always right. **Weight traffic goes to DRAM; this cache fits in L2.** Same shape of loop, opposite
+lever, and the byte model gave the wrong answer for the first time in this log.
+
+### In the engine (prompt 2048, width 32, reps 2)
+
+| | before | HG=4 | HG=4/NT=16 |
+|---|---|---|---|
+| `sdpa:context` | 30420 ms | 7588 | **5829** (5.22x) |
+| `mla:sdpa` | 39868 (17.0%) | 17028 (8.1%) | 15280 (7.4%) |
+| prefill min | 52.272 ms/tok | 48.582 | 48.589 |
+
+Control: `sdpa:scores`, untouched by any of this, 5770 -> 5614 -> 5590. Decode is unchanged at
+11.55 tok/s (its contexts are short, so `k_context` is not where its time goes).
+
+Note the honest split: **HG bought the 7.0% end-to-end, NT bought 1.30x more on the kernel and
+under 1% end-to-end.** `sdpa` is now 7.4% of prefill with `scores` and `context` about equal, which
+is the point where this stops being the largest lever.
+
+### Two traps, both caught, both worth remembering
+
+**1. A kernel that fails to launch looks infinitely fast.** The first HG sweep reported HG=32 as
+6.3x faster than HG=16 and HG=64 faster still — 12x off the trend the valid points sat on. Both
+were `too many resources requested for launch`: `acc[HG]` at 512 threads exceeds the register
+budget, the kernel never ran, and dprof honestly timed an empty stream slot. Nothing in the
+benchmark noticed; only `gate_mla` did. Launches are now checked by `KCHK` and name the kernel.
+The impossible-row rule from `dprof.h` generalises: **a row far off its own trend line in the
+"too good" direction is a broken measurement, not a fast kernel.**
+
+**2. A correctness check can reject a correct kernel.** `bench_context` compares every grid point
+against HG=4/NT=1, and the first two runs rejected all 10 NT>1 points at max_rel ~1e-2, grouped
+perfectly by NT and stable across reps. Both causes were the test, not the kernel: `s` was
+generated with random SIGNS, so a 2048-term sum cancels to near zero, and max-per-element relative
+error then divides a 1e-7 absolute error by a near-zero output. Fixed by generating `s` as an
+actual softmax row (non-negative, summing to 1) and scoring with relative L2. Reassociation from
+t-tiling is real and unavoidable; the metric has to be able to tell it from a bug.
+
+**3. A failed build left gates that passed.** `scripts/build.sh` has `set -e`, so a compile error
+in `kernels/mla.cu` stopped the run — after the earlier targets were already written. The stale
+`gate_mla`, `gate_mla_sparse` and `gate_batch` from the previous revision then ran and reported
+13/13 green on code that did not compile. `build.sh` now deletes every target before building.
+CLAUDE.md §2 says a gate that passes against a dead engine is worse than no gate; this is how one
+gets created by accident.

@@ -18,6 +18,7 @@
 // and it is why only the 512-wide latent needs caching: 88 MiB at 8k context across all 11 layers,
 // against 1408 MiB for the expanded form.
 #include "mla.h"
+#include "mla_context.cuh"
 #include "dprof.h"
 #include "indexer.h"
 #include "gemv.h"
@@ -43,10 +44,10 @@ namespace glm5 {
     fprintf(stderr, "cuda launch %s (%s:%d): %s\n", name, __FILE__, __LINE__, \
             cudaGetErrorString(e_)); abort(); } } while(0)
 
-static constexpr int Hh = MLA_HEADS;      // 64
+// Hh and Lk come from mla_context.cuh, which the k_context family needs to be self-contained
+// for tools/bench_context.cu.
 static constexpr int Dq = MLA_QK_NOPE;    // 256
 static constexpr int Dv = MLA_V_HEAD;     // 256
-static constexpr int Lk = MLA_KV_LORA;    // 512
 static constexpr int ROW = Dq + Dv;       // 512 rows of kv_b per head
 
 // Tokens per block in the batched absorb/expand kernels. Every weight byte is read once per chunk,
@@ -59,15 +60,36 @@ static constexpr int ROW = Dq + Dv;       // 512 rows of kv_b per head
 // Heads per block in k_context. Lowering it multiplies BOTH the block count and the cache traffic
 // by the same factor, so sweeping it separates an occupancy-bound kernel from a traffic-bound one
 // with a known sign in each direction. See OPTIMIZATION_LOG #15.
+// Swept on the real kernel by tools/bench_context.cu; see OPTIMIZATION_LOG #16 for the grid.
+// The result inverts the obvious model: HG=4 reads the latent cache 16 times per call and beats
+// HG=16, which reads it 4 times, by 6.5x. The cache is L2-resident at these sizes (the winning
+// point runs at 610 GB/s against a 237 GB/s streaming read), so re-reads are nearly free and the
+// binding constraint is per-SM occupancy, which acc[HG] destroys. Below HG=4 the traffic finally
+// bites -- HG=1 saturates L2 at ~1290 GB/s and loses.
 #ifndef MLA_HG
 #define MLA_HG 4
+#endif
+
+// t-tiles per k_context launch. Splitting the CACHED-TOKEN axis is how this kernel gets blocks
+// without paying for them: each tile owns a disjoint slice of the latent cache, so NT tiles read
+// the cache once between them, where NT head-groups would each read all of it. That is the whole
+// difference from the HG knob -- lowering HG bought parallelism at 1 extra full cache read per
+// block, and hit the L2 ceiling at ~419 GB/s; NT buys the same parallelism at zero extra reads,
+// and costs only the partial buffer it writes and the reduce pass that sums it.
+//
+// NT is a COMPILE-TIME CONSTANT and grid.y is always NT, including for the sparse twin whose
+// count lives on the device. Tiles that fall past the end write zeros rather than being skipped
+// on the host, which is what lets the dense and sparse paths partition t identically and stay
+// bit-exact against each other (tests/gate_mla_sparse.cu).
+#ifndef MLA_NT
+#define MLA_NT 16
 #endif
 
 // workspace: q_resid[1536] | q[16384] | c_new[512] | qa[64*512] | scores[64*max_ctx] |
 //            ctx[64*512] | heads[16384]
 size_t mla_workspace_floats(int max_ctx) {
     return MLA_Q_LORA + MLA_Q_DIM + Lk + (size_t)Hh * Lk + (size_t)Hh * max_ctx
-         + (size_t)Hh * Lk + (size_t)Hh * Dv;
+         + (size_t)Hh * Lk + (size_t)Hh * Dv + (size_t)MLA_NT * Hh * Lk;
 }
 
 // qa AND ctx are now per-token, because absorb_q and expand_v batch over M (see
@@ -76,7 +98,8 @@ size_t mla_workspace_floats(int max_ctx) {
 // chain is still serial over tokens, so one [64, max_ctx] scratch is reused.
 size_t mla_batch_workspace_floats(int max_ctx, int M) {
     return (size_t)M * (MLA_Q_LORA + MLA_Q_DIM + Lk + (size_t)Hh * Dv)
-         + (size_t)M * Hh * Lk + (size_t)Hh * max_ctx + (size_t)M * Hh * Lk;
+         + (size_t)M * Hh * Lk + (size_t)Hh * max_ctx + (size_t)M * Hh * Lk
+         + (size_t)MLA_NT * Hh * Lk;          // k_context partials, reused across the M loop
 }
 
 // qa[h][l] = sum_{d<256} q[h][d] * kv_b[(h*512 + d)*512 + l]
@@ -181,27 +204,6 @@ __global__ void k_scores_sel(float* __restrict__ scores, const float* __restrict
     }
 }
 
-// Sparse twin of k_context. Same head-group amplification; the only change is the gather.
-template <int HG>
-__global__ void k_context_sel(float* __restrict__ ctx, const float* __restrict__ s,
-                              const float* __restrict__ cache, const int32_t* __restrict__ sel,
-                              const int32_t* __restrict__ n_ptr, int max_ctx) {
-    const int n_sel = *n_ptr;
-    const int h0 = blockIdx.x * HG, l = threadIdx.x;
-    float acc[HG];
-    #pragma unroll
-    for (int i = 0; i < HG; ++i) acc[i] = 0.f;
-    for (int i = 0; i < n_sel; ++i) {
-        const int t = sel[i];
-        if (t < 0) continue;
-        const float c = cache[(size_t)t * Lk + l];
-        #pragma unroll
-        for (int j = 0; j < HG; ++j) acc[j] += s[(size_t)(h0 + j) * max_ctx + i] * c;
-    }
-    #pragma unroll
-    for (int i = 0; i < HG; ++i) ctx[(size_t)(h0 + i) * Lk + l] = acc[i];
-}
-
 // softmax over the n_tok visible positions, one block per head.
 template <int BS>
 __global__ void k_softmax(float* __restrict__ s, int n_tok, int max_ctx) {
@@ -252,25 +254,6 @@ __global__ void k_softmax_dev(float* __restrict__ s, const int32_t* __restrict__
     if (threadIdx.x == 0) { float v = 0; for (int k = 0; k < BS / 32; ++k) v += rs[k]; tot = v; }
     __syncthreads();
     for (int t = threadIdx.x; t < n_tok; t += BS) row[t] /= tot;
-}
-
-// ctx[h][l] = sum_t a[h][t] * C[t][l]
-// One block per group of HG heads, 512 threads (one per latent lane). C[t][l] is read once per
-// head-group rather than once per head: 4x amplification instead of 64x.
-template <int HG>
-__global__ void k_context(float* __restrict__ ctx, const float* __restrict__ s,
-                          const float* __restrict__ cache, int n_tok, int max_ctx) {
-    const int h0 = blockIdx.x * HG, l = threadIdx.x;
-    float acc[HG];
-    #pragma unroll
-    for (int i = 0; i < HG; ++i) acc[i] = 0.f;
-    for (int t = 0; t < n_tok; ++t) {
-        const float c = cache[(size_t)t * Lk + l];       // coalesced across threads
-        #pragma unroll
-        for (int i = 0; i < HG; ++i) acc[i] += s[(size_t)(h0 + i) * max_ctx + t] * c;
-    }
-    #pragma unroll
-    for (int i = 0; i < HG; ++i) ctx[(size_t)(h0 + i) * Lk + l] = acc[i];
 }
 
 // o[h][d] = sum_l ctx[h][l] * kv_b[(h*512 + 256 + d)*512 + l]
@@ -338,6 +321,7 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
     float* scores  = qa + (size_t)Hh * Lk;
     float* ctx     = scores + (size_t)Hh * max_ctx;
     float* heads   = ctx + (size_t)Hh * Lk;
+    float* cpart   = heads + (size_t)Hh * Dv;                   // [NT, 64, 512]
     const int n_tok = t + 1;
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));   // 1/16
 
@@ -358,8 +342,11 @@ void mla_decode_step(const float* x, const MlaWeights& W, float* cache, int t, i
     k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa, cache, n_tok, max_ctx, scaling);
     k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
     constexpr int HG = MLA_HG;
-    k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
-    KCHK("k_context");
+    constexpr int NT = MLA_NT;
+    k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
+    KCHK("k_context_part");
+    k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx, cpart);
+    KCHK("k_context_reduce");
     k_expand_v<128><<<Hh * Dv, 128, 0, s>>>(heads, ctx, (const __nv_bfloat16*)W.kv_b);
     gemv(y, W.o_proj, heads, HIDDEN, Hh * Dv, W.dtype, s);
 }
@@ -373,6 +360,7 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
     float* qa      = heads + (size_t)M * Hh * Dv;               // [M, 64, 512]
     float* scores  = qa + (size_t)M * Hh * Lk;                  // [64, max_ctx]  one token at a time
     float* ctx     = scores + (size_t)Hh * max_ctx;             // [M, 64, 512]
+    float* cpart   = ctx + (size_t)M * Hh * Lk;                 // [NT, 64, 512], reused per token
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));   // 1/16
     const int MG = (M + MLA_MB - 1) / MLA_MB;
 
@@ -404,8 +392,11 @@ void mla_batch_step(const float* x, const MlaWeights& W, float* cache, int pos0,
         k_scores<TT><<<(n_tok + TT - 1) / TT, TT * 32, 0, s>>>(scores, qa_m, cache, n_tok, max_ctx, scaling);
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
         constexpr int HG = MLA_HG;
-        k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, n_tok, max_ctx);
-        KCHK("k_context");
+        constexpr int NT = MLA_NT;
+        k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
+        KCHK("k_context_part");
+        k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx_m, cpart);
+        KCHK("k_context_reduce");
     }
 
     k_expand_v_batch<128, MLA_MB><<<dim3(Hh * Dv, MG), 128, 0, s>>>(
@@ -430,6 +421,7 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     float* scores  = qa + (size_t)Hh * Lk;
     float* ctx     = scores + (size_t)Hh * max_ctx;
     float* heads   = ctx + (size_t)Hh * Lk;
+    float* cpart   = heads + (size_t)Hh * Dv;                   // [NT, 64, 512]
     const int n_tok = t + 1;
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
 
@@ -458,6 +450,7 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
     dprof_end(DP_M_ABSORB, s);
     constexpr int TT = 8;
     constexpr int HG = MLA_HG;
+    constexpr int NT = MLA_NT;
 
     dprof_begin(DP_M_SDPA, s);
     if (n_tok <= DENSE_CTX_LIMIT && !force_sparse) {
@@ -472,8 +465,10 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
         k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
         dprof_end(DP_S_SOFTMAX, s);
         dprof_begin(DP_S_CONTEXT, s);
-        k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, n_tok, max_ctx);
-        KCHK("k_context");
+        k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
+        KCHK("k_context_part");
+        k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx, cpart);
+        KCHK("k_context_reduce");
         dprof_end(DP_S_CONTEXT, s);
     } else {
         // The indexer consumes the SAME q_resid the attention does — it is the q-side LoRA output,
@@ -488,8 +483,10 @@ void mla_decode_step_dsa(const float* x, const MlaWeights& W, const IndexerWeigh
         k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
         dprof_end(DP_S_SOFTMAX, s);
         dprof_begin(DP_S_CONTEXT, s);
-        k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx, scores, cache, sel, nsel, max_ctx);
-        KCHK("k_context_sel");
+        k_context_sel_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, sel, nsel, max_ctx);
+        KCHK("k_context_sel_part");
+        k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx, cpart);
+        KCHK("k_context_reduce");
         dprof_end(DP_S_CONTEXT, s);
     }
     dprof_end(DP_M_SDPA, s);
@@ -511,6 +508,7 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
     float* qa      = heads + (size_t)M * Hh * Dv;               // [M, 64, 512]
     float* scores  = qa + (size_t)M * Hh * Lk;                  // [64, max_ctx]
     float* ctx     = scores + (size_t)Hh * max_ctx;             // [M, 64, 512]
+    float* cpart   = ctx + (size_t)M * Hh * Lk;                 // [NT, 64, 512], reused per token
     const float scaling = rsqrtf((float)(MLA_QK_NOPE + MLA_QK_ROPE));
     const int MG = (M + MLA_MB - 1) / MLA_MB;
 
@@ -546,6 +544,7 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
 
     constexpr int TT = 8;
     constexpr int HG = MLA_HG;
+    constexpr int NT = MLA_NT;
     for (int m = 0; m < M; ++m) {
         const int t = pos0 + m, n_tok = t + 1;
         float* qa_m  = qa  + (size_t)m * Hh * Lk;
@@ -564,8 +563,10 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
             k_softmax<256><<<Hh, 256, 0, s>>>(scores, n_tok, max_ctx);
             dprof_end(DP_S_SOFTMAX, s);
             dprof_begin(DP_S_CONTEXT, s);
-            k_context<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, n_tok, max_ctx);
-            KCHK("k_context");
+            k_context_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, n_tok, max_ctx);
+            KCHK("k_context_part");
+            k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx_m, cpart);
+            KCHK("k_context_reduce");
             dprof_end(DP_S_CONTEXT, s);
         } else {
             indexer_select(x + (size_t)m * HIDDEN, q_resid + (size_t)m * MLA_Q_LORA, IW, IS, t,
@@ -578,8 +579,10 @@ void mla_batch_step_dsa(const float* x, const MlaWeights& W, const IndexerWeight
             k_softmax_dev<256><<<Hh, 256, 0, s>>>(scores, nsel, max_ctx);
             dprof_end(DP_S_SOFTMAX, s);
             dprof_begin(DP_S_CONTEXT, s);
-            k_context_sel<HG><<<Hh / HG, Lk, 0, s>>>(ctx_m, scores, cache, sel, nsel, max_ctx);
-            KCHK("k_context_sel");
+            k_context_sel_part<HG, NT><<<dim3(Hh / HG, NT), Lk, 0, s>>>(cpart, scores, cache, sel, nsel, max_ctx);
+            KCHK("k_context_sel_part");
+            k_context_reduce<NT><<<Hh * Lk / 256, 256, 0, s>>>(ctx_m, cpart);
+            KCHK("k_context_reduce");
             dprof_end(DP_S_CONTEXT, s);
         }
         dprof_end(DP_M_SDPA, s);
