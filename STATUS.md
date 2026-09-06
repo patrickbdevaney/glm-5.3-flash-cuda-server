@@ -120,3 +120,38 @@ Every gate green throughout: `gate_kda` 15/15, `gate_moe` 3/3, `gate_layer` 12/1
 streams 235-247. The only lever left is `B_tok` itself — ROOFLINE §3, the NVFP4 conversion of the
 13.32 GiB of bf16 dense weights, now correctly ordered *after* the MoE and worth ~1.5x
 (~12.8 tok/s). It is a checkpoint change, not a kernel change, and it has not been started.
+
+## Decode and prefill, after the NVFP4 dense overlay (OPTIMIZATION_LOG #11)
+
+| | before | after | |
+|---|---|---|---|
+| AR decode, 45 layers | 119.63 ms/step | **84.32 ms/step** | **1.42x** |
+| | 8.36 tok/s | **11.86 tok/s** | |
+| prefill @ chunk 16 | 84.0 ms/tok | **61.2 ms/tok** | **1.37x** |
+| `B_tok` | 19.761 G | **9.762 G** | -50.6% |
+| resident | 98.15 GiB | 101.85 GiB | overlay is additive; the bf16 copies stay loaded |
+
+All gates green, `gate_batch`'s M=1 bit-identity included.
+
+**The finding that matters more than the numbers: activation traffic, not weight traffic, was the
+binding term in every batch-1 and batched gemv in this engine.** A gemv reads 4 bytes of x per
+weight — 2 bytes of x per byte of bf16 weight, but 7.1 per byte of NVFP4. That is why halving
+`B_tok` first bought 1.4%, why the batched path cost exactly M times a gemv, and why prefill got
+*worse* with wider chunks. Both are fixed by reusing x across output rows.
+
+### What is left, in order
+
+1. **Expert-gathering in the MoE.** `ffn:moe` is 48% of prefill and still pays full price per
+   token: making the token a grid dimension bought occupancy, not bytes, because 86 distinct
+   experts is ~400 MB per layer and nothing like an L2 working set. One block per distinct
+   expert, looping over its token list with the weight row in registers, is worth ~1.4x more on
+   prefill at width 32. It is a new kernel.
+2. **The NVFP4 accuracy decision.** cos 0.9972 over three KDA layers against the PyTorch oracle;
+   uniform rel 0.088-0.100 per tensor, no family worse than another. Reverting a family is a
+   re-run of `tools/requant_dense_nvfp4.py --families`; `GLM5_DENSE_NVFP4=0` reverts all of it
+   with no file touched.
+3. **Speculative decode** is unblocked in principle now that batch cost is sublinear in K, but
+   ROOFLINE §4's curve should be re-measured against the fixed kernel before any head fine-tune.
+4. Still owed from before: long-context correctness above 2051 on the full model, and the
+   unprofiled >34-minute prefill (which was at least partly this — prefill was ~82 ms/tok, so
+   3,400 tokens was ~4.6 minutes of kernel time, not 34).

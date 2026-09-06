@@ -62,6 +62,13 @@ AR wall     12.14  -> 24.85 tok/s   @ 240 GB/s
 resident    98.15  -> 88.57 GiB     (Thor envelope ~117 GiB)
 ```
 
+> **DONE, and the arithmetic was right while the reasoning behind it was wrong.** `B_tok` is
+> 9.762 G (measured off the shards, -50.6%) and decode is 11.86 tok/s. But the first cut of the
+> kernel delivered the whole byte reduction for **1.4%**, because a gemv reads 4 bytes of
+> activation per weight and NVFP4 makes that 7.1 bytes of x per byte of weight. The bytes removed
+> were never the binding term. See OPTIMIZATION_LOG #11 — the win came from making each block
+> reuse x across R output rows, not from removing the weights.
+
 **Ordering resolved; this is now the NEXT lever, and the only one left.** The claim below assumed
 every phase converts bytes to time at the same rate. Profiled, they did not: the phases this
 lever targets already ran at 72-86% of achievable bandwidth while the MoE ran at 13% and owned
@@ -127,6 +134,15 @@ Spec decode was a **net slowdown** on the GGUF build of this model — not becau
 was weak (72.26% depth-1 acceptance un-fine-tuned, `glm53-nvfp4-mtp-gate2`) but because
 llama.cpp's batch cost is flat below 32 tokens and a depth-K draft makes a K+1 batch
 (`llamacpp-small-batch-offload-cliff`).
+
+> **MEASURED, AND IT WAS LINEAR, NOT FLAT.** Everything below was a prediction about a kernel
+> that had not been profiled. `tools/bench_gemv --m` shows weight bandwidth of 210, 111, 56, 28.7,
+> 14.2 GB/s at M = 1, 2, 4, 8, 16 — exactly 1/M. The gemm read W once and cost M times as much
+> anyway, because it read M rows of x per weight and x was already the binding term at M=1. A
+> depth-K verify would have cost K AR steps and won nothing at any acceptance rate.
+> OPTIMIZATION_LOG #11 fixes it by chunking M and tiling output rows; the tables below are still
+> the right shape, but the "cost" column is only now approaching them, and the MoE half of it
+> needs expert-gathering that does not exist yet.
 
 **The reason that does not have to repeat here is that the batch-cost curve is ours to build.**
 At bs=1 decode this model reads 19.76 GB of weights to produce one token. Verifying K+1 tokens
