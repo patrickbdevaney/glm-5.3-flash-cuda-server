@@ -1,0 +1,12 @@
+engine: dense NVFP4 overlay ACTIVE
+engine: 58840 tensors, 101.85 GiB resident, 45 layers, max_ctx 2016
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (43.31 MiB latent cache at 2016 ctx)
+condition: dense NVFP4 overlay ACTIVE
+32 sequences, chunk 32, len [256, 2000]
+    8/32 seq   tokens 11395   ppl 4.81897
+   16/32 seq   tokens 23812   ppl 4.47392
+   24/32 seq   tokens 37109   ppl 4.58235
+   32/32 seq   tokens 47195   ppl 4.49967
+
+TOKENS 47195   MEAN_NLL 1.50400474   PPL 4.499673
+wrote logs/ppl_nvfp4.bin (47195 tokens)

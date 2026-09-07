@@ -1,0 +1,12 @@
+engine: dense NVFP4 overlay present but DISABLED
+engine: 57604 tensors, 98.15 GiB resident, 45 layers, max_ctx 2016
+engine: 34 KDA layers (145.56 MiB state, context-independent), 11 full-attn layers (43.31 MiB latent cache at 2016 ctx)
+condition: dense NVFP4 overlay DISABLED (bf16 reference)
+32 sequences, chunk 32, len [256, 2000]
+    8/32 seq   tokens 11395   ppl 4.77095
+   16/32 seq   tokens 23812   ppl 4.41330
+   24/32 seq   tokens 37109   ppl 4.51410
+   32/32 seq   tokens 47195   ppl 4.43046
+
+TOKENS 47195   MEAN_NLL 1.48850273   PPL 4.430457
+wrote logs/ppl_bf16.bin (47195 tokens)

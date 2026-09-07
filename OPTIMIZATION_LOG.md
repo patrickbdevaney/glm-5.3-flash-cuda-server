@@ -1020,3 +1020,58 @@ now — GGUF and NVFP4 — the head was fine and the target's batch behaviour wa
 both times the head was the thing that looked like the work. On GGUF the cause was
 `op_offload_min_batch_size = 32`; here it is expert routing, which no amount of engineering
 removes.
+
+---
+
+## 18. The NVFP4 accuracy call, settled with perplexity
+
+The dense overlay (#13) halved `B_tok` and bought 1.42x on decode, and every gate said "close":
+`gate_nvfp4` 12/12 at cos 0.9950-0.9961 per tensor, `gate_stack` cos 0.9972 over three layers.
+None of that answers whether the model got worse, so the decision sat open. It is now measured.
+
+`tools/perplexity.cu`, 32 sequences / **47,195 tokens** from the preserved capture corpus
+(`artifacts/iq3m_mtp_capture/corpus`) — already tokenized with this model's tokenizer, so both
+conditions index byte-identical input. Every sequence is under `DENSE_CTX_LIMIT`, so dense MLA is
+exact and no DSA approximation can masquerade as a quantization effect. The only variable is
+`GLM5_DENSE_NVFP4`.
+
+| | PPL | mean NLL |
+|---|---|---|
+| bf16 (reference) | 4.430457 | 1.48850273 |
+| NVFP4 overlay | 4.499673 | 1.50400474 |
+| **delta** | **+0.069216 (+1.56%)** | **+0.01550** |
+
+**The degradation is real, not noise.** Naive standard error on the mean per-token delta is
+0.00176, so +0.0155 is **8.8 sigma**; and NVFP4 was worse at all four running checkpoints
+(8/16/24/32 sequences), a clean 4-of-4 sign test. Tokens within a sequence are correlated so the
+effective N is below 47,195, but the direction is not in question.
+
+### Perplexity alone would have been the wrong number to stop at
+
+| | |
+|---|---|
+| top-1 agreement | **90.101%** (4,672 of 47,195 tokens differ) |
+| median per-token NLL delta | +0.000475 — essentially zero |
+| p5 / p95 | -0.485 / +0.541 |
+| tokens moving >0.1 nats | 42.3% |
+
+So the *typical* token is unchanged, and the mean is a small positive drift on top of a wide,
+nearly symmetric perturbation. A 10% top-1 flip rate looks alarming until you ask WHERE the flips
+are: on disagreements the reference's median NLL is **2.2054** (it was giving its own top choice
+about 11% probability), against **0.3547** where they agree. **Confident disagreements — reference
+NLL < 0.5, i.e. the bf16 model was >60% sure — are 65 tokens, 0.138% of the total.** The overlay
+reshuffles the model's coin-flips and leaves its convictions alone. At the shipped generation
+config (temperature 1.0, top_p 0.95) those coin-flips were being sampled anyway.
+
+### The call
+
+**Keep the overlay on.** +1.56% perplexity for 1.42x decode throughput, with 99.86% of
+high-confidence predictions preserved, is a good trade on a box where decode is the binding
+constraint. It is not free, and this is the number to quote — not the 0.9972 cosine, which implied
+a much smaller effect than 1.56% and 90% top-1.
+
+`GLM5_DENSE_NVFP4=0` still reverts everything with no file touched. Untested and available if the
+1.56% ever matters: reverting **`lm_head` alone** to bf16 (re-run `requant_dense_nvfp4.py` with a
+shorter `--families`). It is the one converted tensor that sets the logits directly, so it likely
+owns a disproportionate share of the top-1 flips, and it costs +0.912 G/token of `B_tok` — about
+-8.5% decode — to put back. Whether that trade is better has not been measured.
