@@ -256,6 +256,7 @@ void Engine::reset(cudaStream_t s) {
     CU(cudaMemsetAsync(mla_cache_, 0, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA * 4, s));
     CU(cudaMemsetAsync(idx_state_, 0, (size_t)n_full_ * indexer_state_floats(cfg_.max_ctx) * 4, s));
     seq_.clear();
+    img_spans_.clear();   // image embeddings belong to the sequence that was reset
 }
 
 // streams[h][d] = embed[token][d] for every h — the model broadcasts one embedding across all
@@ -265,6 +266,15 @@ __global__ void k_embed_broadcast(float* __restrict__ streams, const __nv_bfloat
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= HIDDEN) return;
     const float v = __bfloat162float(emb[(size_t)token * HIDDEN + d]);
+    for (int h = 0; h < HC_MULT; ++h) streams[(size_t)h * HIDDEN + d] = v;
+}
+
+// Multimodal twin: the row comes from a precomputed fp32 embedding instead of the token table,
+// and is broadcast into all HC_MULT hyper-connection streams exactly as k_embed_broadcast does.
+__global__ void k_embed_rows(float* __restrict__ streams, const float* __restrict__ row) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= HIDDEN) return;
+    const float v = row[d];
     for (int h = 0; h < HC_MULT; ++h) streams[(size_t)h * HIDDEN + d] = v;
 }
 
@@ -278,6 +288,11 @@ IndexerState Engine::idxState(int slot) {
     S.roll_gate = S.roll_k + IDX_KPOOL * IDX_HEAD_DIM;
     return S;
 }
+
+void Engine::set_image_embeds(int pos0, int n, const float* dev_emb) {
+    img_spans_.push_back({pos0, n, dev_emb});
+}
+void Engine::clear_image_embeds() { img_spans_.clear(); }
 
 void Engine::commit_state_slot(int j, cudaStream_t s) {
     if (j < 0 || j >= cfg_.state_slots) {
@@ -308,6 +323,17 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
     for (int m = 0; m < M; ++m)
         k_embed_broadcast<<<(HIDDEN + 255) / 256, 256, 0, s>>>(
             b_streams_ + (size_t)m * HC_MULT * HIDDEN, (const __nv_bfloat16*)embed_, tokens[m]);
+    // Multimodal: overwrite the broadcast embedding wherever an image covers this position. Done
+    // AFTER the broadcast rather than instead of it so the hyper-connection streams are already
+    // laid out; the image row replaces all HC_MULT copies, exactly as an embedding would.
+    for (const auto& sp : img_spans_)
+        for (int m = 0; m < M; ++m) {
+            const int p = pos0 + m;
+            if (p >= sp.pos0 && p < sp.pos0 + sp.n)
+                k_embed_rows<<<(HIDDEN + 255) / 256, 256, 0, s>>>(
+                    b_streams_ + (size_t)m * HC_MULT * HIDDEN,
+                    sp.dev + (size_t)(p - sp.pos0) * HIDDEN);
+        }
     dprof_end(DP_EMBED, s);
 
     for (int i = 0; i < cfg_.n_layer; ++i) {
@@ -419,6 +445,10 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
 
     dprof_begin(DP_EMBED, s);
     k_embed_broadcast<<<(HIDDEN + 255) / 256, 256, 0, s>>>(streams_, (const __nv_bfloat16*)embed_, token_id);
+    for (const auto& sp : img_spans_)
+        if (pos >= sp.pos0 && pos < sp.pos0 + sp.n)
+            k_embed_rows<<<(HIDDEN + 255) / 256, 256, 0, s>>>(
+                streams_, sp.dev + (size_t)(pos - sp.pos0) * HIDDEN);
     dprof_end(DP_EMBED, s);
 
     // PING-PONG, not a copy. hc_apply reads the pre-site streams as `residual` and writes the

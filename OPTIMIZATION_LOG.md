@@ -1190,3 +1190,43 @@ tower rather than folded into one number.
 The tower is an encoder with a gate. Wiring it to the request path — image decode and
 preprocessing to 1176-wide patch rows, splicing the 256 embeddings at `image_token_id` (154854),
 and the text-side mrope positions — is not built. `vision_forward` is the hard, verifiable half.
+
+### 20b. The rest of the vision path
+
+`vision_forward` was the encoder; this is what feeds it and what consumes it.
+
+**Preprocessing, Python-free** (`src/vision_preproc.cpp`, `tests/gate_vision_preproc.cpp`).
+Decode (stb_image) -> `smart_resize` -> content fit -> zero pad -> rescale 1/255 -> CLIP normalize
+-> patchify. Gated against `Glm5NextImageProcessor` on two real images:
+
+| | small (233x311) | large (1701x2203) |
+|---|---|---|
+| canvas | 252x336, matches | 1708x2212, matches |
+| grid | 18x24 = 432 patches | 122x158 = 19,276 patches |
+| patchify | relL2 1.32e-07 | 1.49e-07 |
+| full path from PNG bytes | **relL2 1.13e-07** | **1.28e-07** |
+
+Both halves are gated separately on purpose: patchify is exact rearrangement, while an antialiased
+bicubic is implementation-defined, so a single number could not say which moved. In the event
+neither moved — `max_abs` is **4.768e-07 on every check, which is exactly 2^-21, one fp32 ulp**.
+The first run failed at a 1e-7 threshold, and the failure was the threshold: the oracle's patches
+come from the processor's normalize and the reference pixels from this script's, and two different
+float32 op orders cannot agree more closely than an ulp. Demanding bit-equality across them is a
+gate that can only fail.
+
+Note that both test images take the **pad** path — the token budget does not bite until ~12.5 M
+pixels — so the bicubic downscale branch is implemented but only lightly exercised. Said here
+rather than left for someone to discover.
+
+**Splicing** (`Engine::set_image_embeds`). The 256 rows per image replace the token embedding at
+their absolute positions, broadcast into all four hyper-connection streams exactly as
+`k_embed_broadcast` does.
+
+**There is no mrope, and that is not an omission.** This model's language side is pure NoPE —
+`qk_rope_head_dim == 0`, `mla_use_nope == true`, no rotary anywhere in its attention — so an image
+contributes nothing to position encoding beyond occupying n consecutive slots, and splicing is
+exactly an embedding swap. Position reaches the language model through the 34 KDA layers. Every
+other VLM needs 3D mrope here; this one does not.
+
+Still open: an HTTP surface that accepts an image. The pieces below it are gated.
+

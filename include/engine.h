@@ -89,6 +89,14 @@ public:
     void forward_batch(const int* tokens, int M, int pos0, float* logits, bool all_logits,
                        cudaStream_t s = 0, bool snapshot = false);
 
+    // MULTIMODAL: rows of `emb` replace the token embedding at absolute positions
+    // [pos0, pos0 + n). Set before prefill; cleared by reset(). The language model is pure NoPE --
+    // there is no rotary anywhere in its attention -- so an image contributes nothing to position
+    // encoding beyond occupying n consecutive slots, and splicing is exactly an embedding swap.
+    // That is why there is no mrope here: position reaches the LLM through the KDA layers.
+    void set_image_embeds(int pos0, int n, const float* dev_emb);
+    void clear_image_embeds();
+
     // Make slot j the canonical state. This is how a speculative verify accepts j of K drafts.
     void commit_state_slot(int j, cudaStream_t s = 0);
     IndexerState idxState(int slot);
@@ -191,6 +199,11 @@ private:
     // Everything the resident state has already consumed, prompt and generated alike. A request
     // whose ids begin with exactly this can skip straight to the tail — see generate().
     std::vector<int> seq_;
+
+    // Image embeddings pending for this sequence: absolute position -> device row. Kept as a few
+    // ranges rather than a per-token map because an image is always contiguous.
+    struct ImgSpan { int pos0, n; const float* dev; };
+    std::vector<ImgSpan> img_spans_;
 
     std::vector<std::pair<float,int>> scratch_;             // sampler workspace, reused
 

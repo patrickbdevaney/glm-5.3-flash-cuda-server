@@ -19,6 +19,11 @@ E="src/engine.cu $K"
 for g in gate_tokenizer gate_encoding gate_sample gate_stream gate_api; do
   g++ -O2 -std=c++17 -I include tests/$g.cpp -o build/$g && echo "built build/$g"
 done
+# preprocessing is host-only but includes vision.h for the geometry constants, so it needs the
+# CUDA headers on the include path even though it launches nothing.
+CUDA_INC="$(dirname "$(which nvcc)")/../include"
+g++ -O2 -std=c++17 -I include -I "$CUDA_INC" tests/gate_vision_preproc.cpp src/vision_preproc.cpp \
+    -o build/gate_vision_preproc && echo "built build/gate_vision_preproc"
 
 for g in gate_kda gate_moe gate_layer gate_mla; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $K -o build/$g && echo "built build/$g"
