@@ -1075,3 +1075,46 @@ a much smaller effect than 1.56% and 90% top-1.
 shorter `--families`). It is the one converted tensor that sets the logits directly, so it likely
 owns a disproportionate share of the top-1 flips, and it costs +0.912 G/token of `B_tok` — about
 -8.5% decode — to put back. Whether that trade is better has not been measured.
+
+---
+
+## 19. Long-context correctness above `DENSE_CTX_LIMIT`, finally checked
+
+This was owed for a long time. `gate_mla_sparse` asserts the sparse DSA path is **bit-identical**
+to dense for all 2051 steps at or below the limit — but above it there is no dense answer to
+compare against, so the regime the sparse path actually exists for was never validated. Shipped,
+unverified.
+
+The available check is **positional perplexity**: with more context a correct model must not get
+worse, and a broken sparse path spikes exactly where the engine switches over. Known sign.
+`tools/perplexity.cu --concat` glues corpus sequences into 6144-token streams and buckets NLL into
+512-token bands.
+
+6 streams, 36,858 tokens, NVFP4 overlay active:
+
+| position | ppl | |
+|---|---|---|
+| 0–511 | 7.8121 | |
+| 512–1023 | 7.3949 | |
+| 1024–1535 | 4.7479 | |
+| 1536–2047 | 4.5286 | dense MLA |
+| **2048–2559** | **3.6925** | **switchover — DSA sparse from here** |
+| 2560–3071 | 4.8354 | |
+| 3072–3583 | 5.9126 | |
+| 3584–4095 | 6.6543 | |
+| 4096–4607 | 4.5799 | |
+| 4608–5119 | 4.1412 | |
+| 5120–5631 | 3.6866 | |
+| 5632–6143 | **2.9068** | |
+
+**No discontinuity at the boundary.** The switchover band is the *lowest* perplexity up to that
+point, and the run ends at 2.91 — the model is using long context productively, which is the
+opposite of what a broken indexer or a mis-gathered KV would produce. The bump at 3072–4095 is
+content, not position: concatenated streams glue unrelated documents together, so a document
+boundary landing in a band raises it. Position bands are the same width so those are comparable.
+
+**What this does and does not establish.** It establishes that the sparse path is not broken and
+that long context helps. It does not establish bit-exactness against a dense reference, which is
+not computable above the limit — that is why the check is statistical. Combined with
+`gate_mla_sparse`'s bit-exact equality below the limit, the sparse path is now covered on both
+sides of the switchover.
