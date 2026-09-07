@@ -504,8 +504,13 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
         dprof_end(DP_HC_POST_FFN, s);
     }
 
-    if (!logits) return;
-    const int first = all_logits ? 0 : M - 1;
+    // Pool ALWAYS, even when the caller wants no logits: b_pooled_ is what pooledDev() hands to
+    // /v1/embeddings, and folding it into the lm_head skip meant every embedding came back as
+    // 4096 zeros -- which normalises to zero and yields a cosine of 0.0000 between every pair,
+    // a result that looks like a broken model rather than an unwritten buffer.
+    // Only the last token is pooled when logits are skipped, so this costs one head_mean.
+    const int first = (logits && all_logits) ? 0 : M - 1;
+    pooled_row_ = M - 1;                       // what pooledDev() must point at
     dprof_begin(DP_HEAD_MEAN, s);
     for (int m = first; m < M; ++m) {
         hc_head_mean(b_streams_ + (size_t)m * HC_MULT * HIDDEN, b_pooled_ + (size_t)m * HIDDEN, s);
@@ -513,6 +518,7 @@ void Engine::forward_batch(const int* tokens, int M, int pos0, float* logits, bo
                 final_norm_, GEMV_BF16, HIDDEN, s);
     }
     dprof_end(DP_HEAD_MEAN, s);
+    if (!logits) return;                       // pooled is valid; lm_head is the part being skipped
     dprof_begin(DP_LM_HEAD, s);
     gemm(logits, lm_head_, b_pooled_ + (size_t)first * HIDDEN, M - first, VOCAB, HIDDEN, GEMV_BF16, s);
     dprof_end(DP_LM_HEAD, s);
@@ -662,10 +668,36 @@ GenStats Engine::generate(const std::vector<int>& ids, const GenParams& p,
         return false;
     };
 
+    // log-softmax of one token, plus the top alternatives. Two passes for numerical safety: a
+    // straight exp() over 154880 logits overflows long before the max-subtracted form does.
+    auto record_lp = [&](int tok) {
+        if (!p.out_logprobs) return;
+        const float* L = logits_host_;
+        float mx = L[0];
+        for (int i = 1; i < VOCAB; ++i) if (L[i] > mx) mx = L[i];
+        double sum = 0;
+        for (int i = 0; i < VOCAB; ++i) sum += exp((double)L[i] - mx);
+        const double lse = mx + log(sum);
+        TokenLogprob tl;
+        tl.id = tok;
+        tl.logprob = (float)((double)L[tok] - lse);
+        if (p.n_logprobs > 0) {
+            const int k = p.n_logprobs < VOCAB ? p.n_logprobs : VOCAB;
+            std::vector<int> idx(VOCAB);
+            for (int i = 0; i < VOCAB; ++i) idx[i] = i;
+            std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                              [&](int a, int b) { return L[a] > L[b]; });
+            for (int i = 0; i < k; ++i) tl.top.emplace_back(idx[i], (float)((double)L[idx[i]] - lse));
+        }
+        p.out_logprobs->push_back(std::move(tl));
+    };
+    if (p.out_logprobs) p.out_logprobs->clear();
+
     int next = sample(logits_host_, VOCAB, p.sampling, rng, scratch_);
     for (int n = 0; n < p.max_tokens; ++n) {
         if (is_eos(next)) { st.hit_eos = true; break; }     // EOS never reaches the callback
         ++st.completion_tokens;
+        record_lp(next);
         if (on_token && !on_token(next)) break;
         if ((int)seq_.size() >= cfg_.max_ctx) break;
         if (n + 1 >= p.max_tokens) break;                   // no need to run a forward we discard

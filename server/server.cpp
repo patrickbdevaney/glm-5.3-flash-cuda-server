@@ -81,6 +81,28 @@ struct RunResult {
     bool truncated = false;          // stopped on max_tokens rather than EOS
 };
 
+// OpenAI's logprobs shape. `bytes` is the raw UTF-8 of the piece, which clients use to re-align
+// token boundaries with the text they were streamed.
+static json logprobs_json(const std::vector<glm5::TokenLogprob>& lps) {
+    json content = json::array();
+    for (const auto& l : lps) {
+        const std::string piece = g_tok.decode({l.id}, /*skip_special=*/false);
+        json bytes = json::array();
+        for (unsigned char c : piece) bytes.push_back((int)c);
+        json e{{"token", piece}, {"logprob", l.logprob}, {"bytes", bytes}};
+        json top = json::array();
+        for (const auto& t : l.top) {
+            const std::string tp = g_tok.decode({t.first}, false);
+            json tb = json::array();
+            for (unsigned char c : tp) tb.push_back((int)c);
+            top.push_back(json{{"token", tp}, {"logprob", t.second}, {"bytes", tb}});
+        }
+        e["top_logprobs"] = top;
+        content.push_back(e);
+    }
+    return json{{"content", content}};
+}
+
 // One generation, with the token->text->stop-string plumbing shared by both endpoints.
 // `on_delta(reasoning, content)` is called as text becomes final; return false to stop.
 static RunResult run_generation(const std::vector<int>& ids, const glm5::GenParams& gp,
@@ -167,15 +189,18 @@ int main(int argc, char** argv) {
         else if (a == "--tokenizer") tokdir = next();
         else if (a == "--host")    host = next();
         else if (a == "--port")    port = atoi(next().c_str());
-        else if (a == "--seqmax")  ec.max_ctx = atoi(next().c_str());
+        else if (a == "--seqmax" || a == "--ctx") ec.max_ctx = atoi(next().c_str());
         // Loading fewer layers is NOT a quality knob — it is a plumbing smoke test. A 3-layer load
         // fits in ~6 GiB and exercises tokenizer -> prompt -> engine -> sampler -> SSE end to end
         // on a box that cannot currently hold the 98 GiB checkpoint. The text is meaningless.
         else if (a == "--n-layer") ec.n_layer = atoi(next().c_str());
         else if (a == "--model")   g_model_name = next();
         else if (a == "--help") {
-            printf("usage: %s [--ckpt DIR] [--tokenizer DIR] [--host H] [--port P] [--seqmax N]"
-                   " [--n-layer N] [--model NAME]\n", argv[0]);
+            printf("usage: %s [--ckpt DIR] [--tokenizer DIR] [--host H] [--port P]\n"
+                   "       [--ctx N | --seqmax N] [--n-layer N] [--model NAME]\n"
+                   "  --ctx    KV/context length; sizes the MLA latent cache (11 layers x N x 512 x 4 B)\n"
+                   "           and the indexer state. The 34 KDA layers cost a FIXED 145.56 MiB\n"
+                   "           regardless of N, so context is cheaper here than in a dense model.\n", argv[0]);
             return 0;
         }
     }
@@ -247,6 +272,113 @@ int main(int argc, char** argv) {
             m_prompt_tok.load() > 0 ? (double)m_cached_tok.load() / m_prompt_tok.load() : 0.0,
             m_queued.load());
         res.set_content(buf, "text/plain; version=0.0.4");
+    });
+
+    // ---- tokenizer introspection -------------------------------------------------------------
+    // Clients that budget context need to count tokens without guessing, and a wrong count is
+    // invisible until a prompt silently overruns. The same encoder the chat path uses.
+    srv.Post("/tokenize", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        try {
+            const json body = json::parse(req.body);
+            const std::string content = body.value("content", std::string());
+            const std::vector<int> ids = g_tok.encode(content);
+            json out{{"tokens", ids}, {"count", (int)ids.size()}};
+            if (body.value("with_pieces", false)) {
+                json pieces = json::array();
+                for (int t : ids) pieces.push_back(json{{"id", t}, {"piece", g_tok.decode({t})}});
+                out["pieces"] = pieces;
+            }
+            res.set_content(out.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", {{"message", e.what()}}}}.dump(), "application/json");
+        }
+    });
+
+    srv.Post("/detokenize", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        try {
+            const json body = json::parse(req.body);
+            std::vector<int> ids;
+            if (body.contains("tokens") && body["tokens"].is_array())
+                for (const auto& t : body["tokens"]) ids.push_back(t.get<int>());
+            res.set_content(json{{"content", g_tok.decode(ids)}}.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json{{"error", {{"message", e.what()}}}}.dump(), "application/json");
+        }
+    });
+
+    // ---- server properties ---------------------------------------------------------------------
+    srv.Get("/props", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        res.set_content(json{
+            {"model", g_model_name},
+            {"n_ctx", eng.maxCtx()},
+            {"n_layer", ec.n_layer},
+            {"vocab_size", (int)glm5::VOCAB},
+            {"hidden_size", (int)glm5::HIDDEN},
+            {"resident_gib", eng.residentGiB()},
+            {"vision", eng.hasVision()},
+            {"eos_ids", json::array({g_tok.eos_ids[0], g_tok.eos_ids[1], g_tok.eos_ids[2]})},
+            {"chat_template", "glm5-next (built in, include/encoding_glm5.h)"},
+            {"capabilities", json::array({"chat", "completions", "embeddings", "tools",
+                                          "reasoning", "streaming",
+                                          eng.hasVision() ? "vision" : "text-only"})}
+        }.dump(), "application/json");
+    });
+
+    // ---- embeddings ------------------------------------------------------------------------------
+    // The LAST token's pooled hidden state, L2-normalized. For a causal decoder that is the
+    // standard choice: every earlier position has only seen a prefix, so mean-pooling them mixes
+    // representations of different amounts of the input. Said plainly because "embeddings" without
+    // a pooling rule is ambiguous and the rule changes the numbers.
+    srv.Post("/v1/embeddings", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        std::vector<std::string> inputs;
+        try {
+            const json body = json::parse(req.body);
+            const auto& in = body.at("input");
+            if (in.is_string()) inputs.push_back(in.get<std::string>());
+            else if (in.is_array()) for (const auto& x : in)
+                if (x.is_string()) inputs.push_back(x.get<std::string>());
+            if (inputs.empty()) throw std::runtime_error("input must be a string or array of strings");
+        } catch (const std::exception& e) {
+            ++m_errors; res.status = 400;
+            res.set_content(json{{"error", {{"message", e.what()},
+                {"type", "invalid_request_error"}}}}.dump(), "application/json");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_lock);
+        json data = json::array();
+        long total = 0;
+        std::vector<float> host(glm5::HIDDEN);
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            std::vector<int> ids = g_tok.encode(inputs[i]);
+            if (ids.empty()) ids.push_back(g_tok.eos_ids[0]);
+            if ((int)ids.size() > eng.maxCtx()) ids.resize(eng.maxCtx());
+            total += (long)ids.size();
+            eng.reset();
+            eng.prefill(ids, nullptr);
+            if (cudaMemcpy(host.data(), eng.pooledDev(), host.size() * 4,
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                ++m_errors; res.status = 500;
+                res.set_content(json{{"error", {{"message", "embedding readback failed"}}}}.dump(),
+                                "application/json");
+                return;
+            }
+            double n2 = 0; for (float v : host) n2 += (double)v * v;
+            const double inv = n2 > 0 ? 1.0 / sqrt(n2) : 1.0;
+            json vec = json::array();
+            for (float v : host) vec.push_back((double)v * inv);
+            data.push_back(json{{"object", "embedding"}, {"index", (int)i}, {"embedding", vec}});
+        }
+        eng.reset();   // the embedding pass trampled the resident prefix; do not let a later
+                       // chat request believe it can reuse it
+        res.set_content(json{{"object", "list"}, {"data", data}, {"model", g_model_name},
+                             {"usage", {{"prompt_tokens", total}, {"total_tokens", total}}}}.dump(),
+                        "application/json");
     });
 
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
@@ -362,6 +494,15 @@ int main(int argc, char** argv) {
         const long created = now_s();
 
         glm5::GenParams gp;
+        // OpenAI chat uses a boolean `logprobs` plus an optional `top_logprobs`; /v1/completions
+        // uses an integer. Both land on the same engine fields.
+        std::vector<glm5::TokenLogprob> lps;
+        bool want_lp = false;
+        try {
+            const json b2 = json::parse(req.body);
+            want_lp = b2.value("logprobs", false);
+            if (want_lp) { gp.out_logprobs = &lps; gp.n_logprobs = b2.value("top_logprobs", 0); }
+        } catch (...) {}
         gp.sampling.temperature = (float)cr.sampling.temperature;
         gp.sampling.top_p = (float)cr.sampling.top_p;
         gp.sampling.top_k = cr.sampling.top_k;
@@ -403,6 +544,7 @@ int main(int argc, char** argv) {
                         r.stats.prompt_tokens, r.stats.completion_tokens, created,
                         r.truncated ? "length" : nullptr);
                 out["usage"]["prompt_tokens_details"] = json{{"cached_tokens", r.stats.cached_tokens}};
+                if (want_lp) out["choices"][0]["logprobs"] = logprobs_json(lps);
                 out["timings"] = timings_json(r.stats);
                 res.set_content(dump_lossy(out), "application/json");
             } catch (const std::exception& e) {
@@ -529,6 +671,11 @@ int main(int argc, char** argv) {
             // A raw completion is a raw completion: the prompt as given, no chat template, and no
             // BOS — this tokenizer's post-processor adds none, and inventing one here would put
             // every /v1/completions request off-distribution relative to /v1/chat/completions.
+            std::vector<glm5::TokenLogprob> lps;
+            {   // /v1/completions takes an INTEGER logprobs, unlike chat's boolean pair.
+                const int nlp = body.value("logprobs", 0);
+                if (nlp > 0) { gp.out_logprobs = &lps; gp.n_logprobs = nlp; }
+            }
             std::vector<int> ids = g_tok.encode(prompt);
             if (ids.empty()) { res.status = 400;
                 res.set_content(json{{"error", {{"message", "empty prompt"}}}}.dump(), "application/json"); return; }
@@ -539,6 +686,7 @@ int main(int argc, char** argv) {
             account(r.stats);
             json choice{{"index", 0}, {"text", r.raw},
                         {"finish_reason", r.truncated ? "length" : "stop"}, {"logprobs", nullptr}};
+            if (gp.out_logprobs) choice["logprobs"] = logprobs_json(lps);
             json out{{"id", "cmpl-" + rand_id()}, {"object", "text_completion"}, {"created", now_s()},
                      {"model", g_model_name}, {"choices", json::array({choice})},
                      {"usage", json{{"prompt_tokens", r.stats.prompt_tokens},

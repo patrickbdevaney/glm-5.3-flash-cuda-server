@@ -99,6 +99,30 @@ done
 cd ~/glm-5.3-flash-cuda-server && bash scripts/gate.sh
 ```
 
+## Server
+
+OpenAI-compatible, no Python on the request path.
+
+| endpoint | |
+|---|---|
+| `POST /v1/chat/completions` | streaming (SSE), reasoning/`<think>` split out, tool calls, **images** |
+| `POST /v1/completions` | raw prompt, no chat template |
+| `POST /v1/embeddings` | last-token pooled hidden, L2-normalized, 4096-d |
+| `POST /tokenize` / `/detokenize` | with `with_pieces` for per-token inspection |
+| `GET /props` | context, vocab, resident GiB, capabilities |
+| `GET /health` `/metrics` `/v1/models` `/` | Prometheus metrics; web UI at `/` |
+
+Sampling: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, `max_tokens`, `reasoning_effort`,
+`logprobs`/`top_logprobs`. Prefix caching reuses the resident state whenever a request extends it,
+which is the ordinary multi-turn case (`usage.prompt_tokens_details.cached_tokens` reports it).
+
+`--ctx N` sets the KV/context length. Only 11 of 45 layers have a KV cache: the 34 KDA layers cost
+a **fixed** 145.56 MiB regardless of N, and the latent cache is `11 * N * 512 * 4` bytes, so
+context is far cheaper here than in a dense model of the same size.
+
+**Images**: `data:` URIs only. A plain http(s) URL is refused on purpose — making an inference
+server fetch arbitrary URLs for a caller is SSRF.
+
 ## Next
 
 1. **Vision.** The checkpoint ships a 24-block vision tower (`model.visual.*`, patch embed, merger,

@@ -34,6 +34,15 @@ struct EngineConfig {
     bool verbose    = true;
 };
 
+// One emitted token's probability information. Filled only when GenParams::out_logprobs is set,
+// because it costs two extra passes over 154880 logits per token -- negligible against an 85 ms
+// step, but not free, and a server that never asks should not pay.
+struct TokenLogprob {
+    int id = 0;
+    float logprob = 0.f;                          // log softmax of the CHOSEN token
+    std::vector<std::pair<int, float>> top;       // top-N alternatives, descending
+};
+
 // What a caller asks for. Defaults are generation_config.json's, not the habitual 0.7/0.9 —
 // this checkpoint ships temperature 1.0 / top_p 0.95 and those are the numbers it was tuned at.
 struct GenParams {
@@ -42,6 +51,11 @@ struct GenParams {
     bool has_seed   = false;                // without one, the seed comes from the clock
     uint64_t seed   = 0;
     std::vector<int> eos_ids;               // three of them for this model; empty = never stop early
+
+    // Logprobs. `n_logprobs` > 0 also records that many alternatives per position. Both are off by
+    // default; `out_logprobs` is owned by the caller and cleared on entry.
+    int n_logprobs = 0;
+    std::vector<TokenLogprob>* out_logprobs = nullptr;
 };
 
 struct GenStats {
@@ -124,6 +138,16 @@ public:
     // The four mHC residual streams after the last layer: [HC_MULT, HIDDEN]. Debug/gate use.
     const float* streamsDev() const { return streams_; }
 
+    // The pooled, final-normed hidden state [M, HIDDEN] — head_mean over the four streams then the
+    // final RMSNorm, i.e. exactly what lm_head consumes and what the MTP block takes as h_prev.
+    // Valid until the next forward, INCLUDING when logits were skipped -- the last token is
+    // always pooled. This is the sentence embedding for /v1/embeddings.
+    //
+    // Returns the LAST TOKEN'S row, not row 0. With all_logits=false only row M-1 of the final
+    // chunk is written, so a caller reading the base pointer gets an untouched buffer -- which
+    // reads as 4096 zeros and a cosine of exactly 0.0000 between every pair of inputs.
+    const float* pooledDev() const { return b_pooled_ + (size_t)pooled_row_ * HIDDEN; }
+
     // Reset all sequence state (KDA recurrent + conv windows, MLA cache). Weights stay resident.
     void reset(cudaStream_t s = 0);
 
@@ -188,6 +212,7 @@ private:
     float* b_normed_  = nullptr;
     float* b_sub_     = nullptr;
     float* b_pooled_  = nullptr;
+    int    pooled_row_ = 0;    // which row of b_pooled_ the last forward actually wrote
     float* b_post_    = nullptr;  // [B, HC_MULT]
     float* b_comb_    = nullptr;  // [B, HC_MULT*HC_MULT]
     float* b_hcws_    = nullptr;
