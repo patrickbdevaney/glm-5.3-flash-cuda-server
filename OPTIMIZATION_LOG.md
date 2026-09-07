@@ -1118,3 +1118,75 @@ that long context helps. It does not establish bit-exactness against a dense ref
 not computable above the limit — that is why the check is statistical. Combined with
 `gate_mla_sparse`'s bit-exact equality below the limit, the sparse path is now covered on both
 sides of the switchover.
+
+---
+
+## 20. The vision tower
+
+The checkpoint ships a complete 24-block vision tower — 347 tensors under `model.visual.` — and
+this server never loaded one byte of it. The GGUF build has vision; this did not. Dropping vision
+capability is on the operator's escalate-first list, so a text-only server was a capability gap,
+not a missing optimisation.
+
+Built, and gated against `transformers`' own `Glm5NextVisionModel`.
+
+### It is the one part of this checkpoint that PyTorch can load
+
+Every other oracle in `ref/` streams a layer at a time, because the full model is not instantiable
+here. The tower is the exception: ~0.5 B params in plain bf16, 1.17 GiB, so it loads whole and the
+gate compares against transformers proper rather than against a reimplementation of it.
+
+### Shape
+
+One 448x448 image is 32x32 patches of 14 -> **1024 rows of 1176** (`channels x temporal_patch x
+patch x patch`), through patch_embed to 1024-wide, 24 blocks, post_layernorm, a 2x2 spatial
+downsample to **256 rows of 4096**, then the merger. Those 256 rows are what splice into the
+language model at the image-token positions.
+
+Two things that look like convolutions and are not: `patch_embed` is a `Conv3d` whose kernel
+EQUALS its stride, so it is a plain gemm over flattened patches; the downsample is a `Conv2d` in
+the same position, so it is a gather of each 2x2 neighbourhood followed by a gemm.
+
+### Four ways it differs from the language model, all of which fail quietly
+
+- MLPs use a **clamped** SwiGLU — gate clamped above at 10.0, up clamped both ways.
+- The merger uses **LayerNorm with bias** and a **GELU**, not RMSNorm and SiLU.
+- `q_norm`/`k_norm` are RMSNorm over `head_dim=64`, per head, **before** rope.
+- Attention is **bidirectional**. No causal mask anywhere in the tower.
+
+### The bug, and the metric that hid a non-bug
+
+`k_rmsnorm_heads` launched **64 threads — two warps — and reduced with `__shfl_down_sync`, which
+is warp-local.** Half the sum of squares was silently dropped, rescaling every head by about
+sqrt(2). The tower came back at cos 0.690: wrong, but far enough from zero to look like a numerics
+problem rather than a bug. It is now launched with exactly one warp.
+
+Then, with that fixed, the gate still failed — and the failure was the **oracle**. The reference
+ran the whole tower in bf16 (`model.to(torch.bfloat16)`), while this engine keeps fp32 activations
+with bf16 weights, so the reference is the LESS precise of the two and its rounding compounds
+across 24 blocks:
+
+| stage | vs bf16 oracle | vs fp32 oracle |
+|---|---|---|
+| patch_embed | cos 0.999998578 | **cos 1.000000000**, relL2 4.34e-07 |
+| block 0 | cos 0.999994162 | **cos 1.000000000**, relL2 7.36e-07 |
+| all 24 blocks | cos 0.997160027 | **cos 1.000000000**, relL2 1.07e-05 |
+| merged | cos 0.997822164 | **cos 1.000000000**, relL2 1.19e-05 |
+| position ids | — | exact, relL2 0.0 |
+| rope cos / sin | — | relL2 1.80e-08 / 1.70e-08 |
+
+`GLM5_VIS_DTYPE=fp32` regenerates the oracle upcast, and the gate defaults to it. **A gate can
+fail because the reference is wrong, and "compare against something more precise than the thing
+under test" is not automatic when the reference is a bf16 model.** Reported with relative L2 rather
+than max-per-element, for the reason established in #16.
+
+Position ids are **not raster order** — patches are visited in 2x2 blocks so that the rope
+agrees with what the downsample later folds together. Getting that wrong scrambles an image
+spatially while still producing fluent captions, which is why it is gated separately from the
+tower rather than folded into one number.
+
+### What is not done
+
+The tower is an encoder with a gate. Wiring it to the request path — image decode and
+preprocessing to 1176-wide patch rows, splicing the 256 embeddings at `image_token_id` (154854),
+and the text-side mrope positions — is not built. `vision_forward` is the hard, verifiable half.

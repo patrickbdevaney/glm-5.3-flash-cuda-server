@@ -31,6 +31,9 @@ nvcc -O2 -std=c++17 $ARCH -I include tests/gate_nvfp4.cu kernels/gemv.cu kernels
      -o build/gate_nvfp4 && echo "built build/gate_nvfp4"
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_mla_sparse.cu $K \
      -o build/gate_mla_sparse && echo "built build/gate_mla_sparse"
+# the vision tower needs no engine: it is a standalone encoder over 347 bf16 tensors
+nvcc -O2 -std=c++17 $ARCH -I include tests/gate_vision.cu kernels/vision.cu kernels/gemv.cu \
+     kernels/layer.cu kernels/dprof.cu -o build/gate_vision && echo "built build/gate_vision"
 # gates that drive the whole engine
 for g in gate_stack gate_batch; do
   nvcc -O2 -std=c++17 $ARCH -I include tests/$g.cu $E -o build/$g && echo "built build/$g"
