@@ -82,7 +82,7 @@ static void run_case(const std::string& R, const char* suf, const char* label) {
     if (!vision_load_image(R + "test_image" + suf + ".png", rgb, &dh, &dw)) {
         printf("  %-22s FAIL  could not decode png\n", "stb decode"); ++g_fail; return; }
     ck(dh == H && dw == W, "stb decode size");
-    PreprocResult P = vision_preprocess_rgb(rgb.data(), dh, dw);
+    PreprocResult P = vision_preprocess_rgb(rgb.data(), dh, dw, 8000);
     ck(P.grid_h == GH && P.grid_w == GW, "full path grid");
     cmp("full path patches", P.patches, want, 1e-6);
 }

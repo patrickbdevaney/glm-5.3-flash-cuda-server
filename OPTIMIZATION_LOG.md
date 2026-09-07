@@ -1230,3 +1230,45 @@ other VLM needs 3D mrope here; this one does not.
 
 Still open: an HTTP surface that accepts an image. The pieces below it are gated.
 
+
+### 20c. The vision HTTP surface, and three bugs that each looked like something else
+
+`POST /v1/chat/completions` now accepts OpenAI `image_url` content parts. End to end on the test
+image (red horizontal gradient + green vertical gradient + blue checkerboard), the model's own
+reasoning reads *"It's a checkerboard pattern (alternating squares). The colors vary across the
+image, forming a gradient."* — 134 prompt tokens (108 image + text), 12.06 tok/s.
+
+`data:` URIs only. **A plain http(s) URL is refused deliberately**: making an inference server
+fetch arbitrary URLs for a caller is server-side request forgery, and a box holding a 100 GiB
+checkpoint on someone's LAN is not where to add one.
+
+The chat encoder already emitted one `<|image|>` per image part; `expand_image_tokens` replaces
+each with the N the tower produced and records where, and `Engine::set_image_embeds` splices there.
+`max_image_tokens` defaults to 1024, far below the processor's 8000, because `k_vis_attn` holds
+the score row in shared memory — the processor's default would allow 32k patches and 128 KB of
+shared, which does not launch.
+
+**Three bugs, and none of them presented as itself.**
+
+1. **`hasVision()` read a lazily-set flag**, so it was false until the first image had already been
+   encoded — every image request was rejected with "no vision tower resident" on a server that had
+   1.17 GiB of vision weights loaded. Now probed at construction.
+2. **A shared size counter meant a buffer was never allocated.** `vis_cos_` and `vis_sin_` shared
+   `vis_rope_n_`; after cos grew, the sin allocation saw the size already satisfied and returned
+   without allocating, so the memcpy ran against a null pointer. Presented as
+   `cuda invalid argument`, three frames away from the cause.
+3. **A deadlock that answered `/metrics` cheerfully.** The image path took `g_lock` with a
+   `unique_lock` and never released it; generation then took the same non-recursive mutex and the
+   request hung forever while the metrics endpoint — which does not take the lock — kept replying
+   `requests_total 0`. A health check would have said the server was fine.
+
+**And one that produced a fluent, plausible, wrong answer:** `reset()` cleared `img_spans_`, and
+`generate()` calls `reset()` for any request that cannot reuse the resident prefix — which is every
+first turn. The embeddings were wiped microseconds after being registered, and the model reported,
+politely and in perfect prose, that no image was attached. **That is the failure mode to fear here:
+not a crash, but a coherent answer to a question the model was never actually shown.** The spans are
+request-scoped and the caller owns them; `reset()` no longer touches them.
+
+Lifetime note worth keeping: the SSE path hands generation to a chunked content provider that
+captures by value and runs *after* the handler returns, so the image buffers are held by a
+`shared_ptr` both paths share rather than a scope guard, which would have freed them mid-stream.

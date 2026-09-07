@@ -20,6 +20,14 @@
 #include "third_party/httplib.h"
 #include "openai_api.h"
 #include "encoding_glm5.h"
+#include "vision_http.h"
+#include "vision_preproc.h"
+#include <memory>
+#include <cuda_runtime.h>
+#define CUDA_OK(x) do { cudaError_t e_=(x); if(e_){ \
+    fprintf(stderr, "cuda %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
+    res.status = 500; res.set_content("{\"error\":{\"message\":\"cuda failure\"}}", \
+        "application/json"); return; } } while(0)
 #include "tokenizer_glm5.h"
 #include "stream_parse.h"
 #include "webui.h"
@@ -272,7 +280,84 @@ int main(int argc, char** argv) {
             return;
         }
 
-        const std::vector<int> ids = g_tok.encode(prompt);
+        std::vector<int> ids = g_tok.encode(prompt);
+
+        // ---- images ----------------------------------------------------------------------
+        // The chat encoder emits one <|image|> per image part, in message order. Each becomes the
+        // N embeddings the tower produces for that image, and the engine splices them at those
+        // absolute positions. Vision work happens under the same lock as generation because it
+        // uses the engine's single vision workspace.
+        std::vector<std::string> img_urls;
+        try { img_urls = glm5api::collect_image_urls(body); }
+        catch (...) { img_urls.clear(); }
+        std::vector<int> img_starts, img_counts;
+        // SHARED OWNERSHIP, not a scope guard. The SSE path hands generation to a chunked content
+        // provider that captures by value and runs AFTER this handler returns, so a guard scoped
+        // here would free the embeddings out from under the stream. Whichever of the two outlives
+        // the other drops the last reference and the deleter runs exactly once.
+        auto img_devs_p = std::shared_ptr<std::vector<const float*>>(
+            new std::vector<const float*>(),
+            [](std::vector<const float*>* v) {
+                g_eng->clear_image_embeds();
+                for (auto* d : *v) cudaFree((void*)d);
+                delete v;
+            });
+        std::vector<const float*>& img_devs = *img_devs_p;
+        std::unique_lock<std::mutex> vis_lk(g_lock, std::defer_lock);
+        if (!img_urls.empty()) {
+            if (!g_eng->hasVision()) {
+                ++m_errors; res.status = 400;
+                res.set_content(json{{"error", {{"message",
+                    "this engine has no vision tower resident (reduced --n-layer?)"},
+                    {"type", "invalid_request_error"}}}}.dump(), "application/json");
+                return;
+            }
+            vis_lk.lock();
+            for (const auto& u : img_urls) {
+                std::vector<uint8_t> bytes; std::string err;
+                if (!glm5::image_bytes_from_url(u, bytes, err)) {
+                    ++m_errors; res.status = 400;
+                    res.set_content(json{{"error", {{"message", err},
+                        {"type", "invalid_request_error"}}}}.dump(), "application/json");
+                    return;
+                }
+                std::vector<uint8_t> rgb; int ih = 0, iw = 0;
+                if (!glm5::vision_decode_image(bytes.data(), bytes.size(), rgb, &ih, &iw)) {
+                    ++m_errors; res.status = 400;
+                    res.set_content(json{{"error", {{"message", "could not decode image"},
+                        {"type", "invalid_request_error"}}}}.dump(), "application/json");
+                    return;
+                }
+                const float* dev = nullptr;
+                const int n = g_eng->encodeImage(rgb.data(), ih, iw, &dev);
+                if (n <= 0) {
+                    ++m_errors; res.status = 400;
+                    res.set_content(json{{"error", {{"message", "vision encode failed"},
+                        {"type", "invalid_request_error"}}}}.dump(), "application/json");
+                    return;
+                }
+                // encodeImage reuses one output buffer, so each image's rows must be taken away
+                // before the next call overwrites them.
+                float* keep = nullptr;
+                CUDA_OK(cudaMalloc(&keep, (size_t)n * glm5::HIDDEN * 4));
+                CUDA_OK(cudaMemcpy(keep, dev, (size_t)n * glm5::HIDDEN * 4, cudaMemcpyDeviceToDevice));
+                img_devs.push_back(keep);
+                img_counts.push_back(n);
+            }
+            // RELEASE BEFORE GENERATION. g_lock is not recursive and both the blocking and the
+            // streaming paths take it again to generate; holding it here deadlocked the request
+            // while /metrics kept answering, which made it look alive. The encoded rows were
+            // already copied out of the engine's reusable buffer above, so nothing needs the lock
+            // past this point.
+            vis_lk.unlock();
+            if (!glm5::expand_image_tokens(ids, img_counts, img_starts)) {
+                ++m_errors; res.status = 400;
+                res.set_content(json{{"error", {{"message",
+                    "image parts and <|image|> tokens disagree"},
+                    {"type", "invalid_request_error"}}}}.dump(), "application/json");
+                return;
+            }
+        }
         const std::string id = rand_id();
         const long created = now_s();
 
@@ -306,6 +391,8 @@ int main(int argc, char** argv) {
             // debug from. It took three sessions and a lost 198-item benchmark to find. Catch it,
             // say what it was, and log it.
             try {
+                for (size_t k = 0; k < img_starts.size(); ++k)
+                    g_eng->set_image_embeds(img_starts[k], img_counts[k], img_devs[k]);
                 const RunResult r = run_generation(ids, gp, /*thinking=*/true, cr.sampling.stop, nullptr);
                 account(r.stats);
                 // The prompt ends with <think>, so the model's output starts INSIDE the reasoning
@@ -335,7 +422,7 @@ int main(int argc, char** argv) {
         res.set_header("Connection", "keep-alive");
         res.set_header("X-Accel-Buffering", "no");
         res.set_chunked_content_provider("text/event-stream",
-            [id, created, ids, gp, cr](size_t, httplib::DataSink& sink) -> bool {
+            [id, created, ids, gp, cr, img_starts, img_counts, img_devs_p](size_t, httplib::DataSink& sink) -> bool {
                 std::lock_guard<std::mutex> lk(g_lock);
                 ++m_requests;
                 bool alive = true;
@@ -353,6 +440,8 @@ int main(int argc, char** argv) {
 
                 RunResult r;
                 try {
+                    for (size_t k = 0; k < img_starts.size(); ++k)
+                        g_eng->set_image_embeds(img_starts[k], img_counts[k], (*img_devs_p)[k]);
                     r = run_generation(ids, gp, /*thinking=*/true, cr.sampling.stop,
                         [&](const std::string& rr, const std::string& cc) -> bool {
                             if (!rr.empty() || !cc.empty())

@@ -89,6 +89,19 @@ public:
     void forward_batch(const int* tokens, int M, int pos0, float* logits, bool all_logits,
                        cudaStream_t s = 0, bool snapshot = false);
 
+    // Is the vision tower resident? False when the engine was built with a reduced --n-layer,
+    // because that path filters the weight load down to the language model.
+    bool hasVision() const { return has_vision_; }
+
+    // Encode one RGB8 HWC image: preprocess, run the tower, and leave [n, HIDDEN] fp32 rows on the
+    // device. Returns n (= grid_h*grid_w/4) and points *dev at engine-owned memory valid until the
+    // next call. Returns 0 if the tower is not resident.
+    //
+    // `max_image_tokens` caps the canvas. The default is far below the processor's 8000 because
+    // k_vis_attn keeps the whole score row in shared memory: at 1024 patches that is 4 KB, but the
+    // processor's default would allow 32k patches and 128 KB, which does not launch.
+    int encodeImage(const uint8_t* rgb, int h, int w, const float** dev, int max_image_tokens = 1024);
+
     // MULTIMODAL: rows of `emb` replace the token embedding at absolute positions
     // [pos0, pos0 + n). Set before prefill; cleared by reset(). The language model is pure NoPE --
     // there is no rotary anywhere in its attention -- so an image contributes nothing to position
@@ -204,6 +217,15 @@ private:
     // ranges rather than a per-token map because an image is always contiguous.
     struct ImgSpan { int pos0, n; const float* dev; };
     std::vector<ImgSpan> img_spans_;
+
+    bool has_vision_ = false;
+    struct VisionWeights* vw_ = nullptr;      // built lazily on the first image
+    float* vis_ws_ = nullptr; size_t vis_ws_n_ = 0;
+    float* vis_out_ = nullptr; size_t vis_out_n_ = 0;
+    float* vis_in_ = nullptr;  size_t vis_in_n_ = 0;
+    float* vis_cos_ = nullptr; size_t vis_cos_n_ = 0;
+    float* vis_sin_ = nullptr; size_t vis_sin_n_ = 0;   // separate counters: sharing one meant the
+                                                       // second buffer was never allocated
 
     std::vector<std::pair<float,int>> scratch_;             // sampler workspace, reused
 

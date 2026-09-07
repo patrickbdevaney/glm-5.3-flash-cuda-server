@@ -117,10 +117,10 @@ void vision_patchify(const float* chw, int H, int W, int* grid_h, int* grid_w,
           }
 }
 
-PreprocResult vision_preprocess_rgb(const uint8_t* rgb, int h, int w) {
+PreprocResult vision_preprocess_rgb(const uint8_t* rgb, int h, int w, int max_tokens) {
     const int factor = VIS_PATCH * VIS_MERGE;         // 28
     int th = 0, tw = 0;
-    vision_smart_resize(h, w, factor, VIS_TPATCH, 16, 8000, &th, &tw);
+    vision_smart_resize(h, w, factor, VIS_TPATCH, 16, max_tokens, &th, &tw);
 
     // Content fit. An image already inside the budget is NOT upscaled -- scale is clamped to 1 --
     // it is placed at the top-left and the canvas is zero-padded.

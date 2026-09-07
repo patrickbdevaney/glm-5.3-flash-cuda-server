@@ -91,6 +91,31 @@ inline ChatRequest parse_chat_request(const json& b) {
     return r;
 }
 
+// Image URLs in message order — the SAME order build_prompt emits <|image|> in, which is what
+// lets the k-th token be matched to the k-th image. If you change one, change both.
+inline std::vector<std::string> collect_image_urls(const nlohmann::json& body) {
+    std::vector<std::string> out;
+    if (!body.contains("messages") || !body["messages"].is_array()) return out;
+    for (const auto& m : body["messages"]) {
+        if (!m.is_object() || !m.contains("content")) continue;
+        const auto& c = m["content"];
+        if (!c.is_array()) continue;
+        for (const auto& it : c) {
+            if (!it.is_object()) continue;
+            const std::string t = it.value("type", "");
+            if (t != "image" && t != "image_url") continue;
+            if (it.contains("image_url")) {
+                const auto& iu = it["image_url"];
+                if (iu.is_string()) out.push_back(iu.get<std::string>());
+                else if (iu.is_object()) out.push_back(iu.value("url", std::string()));
+            } else if (it.contains("image") && it["image"].is_string()) {
+                out.push_back(it["image"].get<std::string>());
+            } else out.push_back(std::string());
+        }
+    }
+    return out;
+}
+
 inline std::string build_prompt(const ChatRequest& r) {
     glm5enc::Options o;
     o.reasoning_effort = r.reasoning_effort;

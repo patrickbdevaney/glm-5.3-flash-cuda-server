@@ -12,7 +12,10 @@ mkdir -p build
 rm -f build/gate_* build/bench_* build/bw_probe build/glm5-server
 ARCH="-gencode arch=compute_110a,code=sm_110a"
 K="kernels/kda.cu kernels/layer.cu kernels/moe.cu kernels/mla.cu kernels/gemv.cu kernels/indexer.cu kernels/dprof.cu"
-E="src/engine.cu $K"
+# the engine can encode images now, so the vision tower and its host-side preprocessing are part
+# of every engine link, not just the vision gate
+V="kernels/vision.cu src/vision_preproc.cpp"
+E="src/engine.cu $K $V"
 
 # CPU-only gates. These need no GPU and no checkpoint weights, so they run anywhere and are the
 # first thing to check when something looks wrong at the text level rather than the tensor level.
@@ -37,7 +40,7 @@ nvcc -O2 -std=c++17 $ARCH -I include tests/gate_nvfp4.cu kernels/gemv.cu kernels
 nvcc -O2 -std=c++17 $ARCH -I include tests/gate_mla_sparse.cu $K \
      -o build/gate_mla_sparse && echo "built build/gate_mla_sparse"
 # the vision tower needs no engine: it is a standalone encoder over 347 bf16 tensors
-nvcc -O2 -std=c++17 $ARCH -I include tests/gate_vision.cu kernels/vision.cu kernels/gemv.cu \
+nvcc -O2 -std=c++17 $ARCH -I include tests/gate_vision.cu $V kernels/gemv.cu \
      kernels/layer.cu kernels/dprof.cu -o build/gate_vision && echo "built build/gate_vision"
 # gates that drive the whole engine
 for g in gate_stack gate_batch; do

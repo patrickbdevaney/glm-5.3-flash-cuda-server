@@ -13,6 +13,8 @@
 // Above 2048 the indexer is required and the engine refuses rather than quietly returning
 // attention over the wrong set of keys.
 #include "engine.h"
+#include "vision.h"
+#include "vision_preproc.h"
 #include "dprof.h"
 #include "gemv.h"
 #include "weight_store.h"
@@ -68,6 +70,12 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
     ws_ = new st::WeightStore(cfg_.model_dir, nullptr, pats.empty() ? nullptr : pats.c_str(),
                               overlays);
     resident_ = ws_->loadedGiB();
+    // Probe now, not on the first image: hasVision() is what the server checks to decide whether
+    // to accept an image part at all, and a lazily-set flag reads false until it is too late.
+    has_vision_ = ws_->has("model.visual.patch_embed.proj.weight") &&
+                  ws_->has("model.visual.merger.down_proj.weight");
+    if (cfg_.verbose)
+        printf("engine: vision tower %s\n", has_vision_ ? "resident" : "ABSENT (reduced --n-layer)");
     dprof_set_nvfp4_dense(nvfp4_dense_);
     if (cfg_.verbose && nvfp4_dense_) printf("engine: dense NVFP4 overlay ACTIVE\n");
     if (cfg_.verbose)
@@ -256,7 +264,10 @@ void Engine::reset(cudaStream_t s) {
     CU(cudaMemsetAsync(mla_cache_, 0, (size_t)n_full_ * cfg_.max_ctx * MLA_KV_LORA * 4, s));
     CU(cudaMemsetAsync(idx_state_, 0, (size_t)n_full_ * indexer_state_floats(cfg_.max_ctx) * 4, s));
     seq_.clear();
-    img_spans_.clear();   // image embeddings belong to the sequence that was reset
+    // NOT img_spans_. generate() calls reset() for any request that cannot reuse the resident
+    // prefix, which is every first turn -- clearing here wiped the image embeddings the caller had
+    // just registered and the model politely reported that no image was attached. The spans are
+    // request-scoped and the caller owns them (Engine::clear_image_embeds).
 }
 
 // streams[h][d] = embed[token][d] for every h — the model broadcasts one embedding across all
@@ -287,6 +298,74 @@ IndexerState Engine::idxState(int slot) {
     S.roll_k    = base + (size_t)idx_max_pools(cfg_.max_ctx) * IDX_HEAD_DIM;
     S.roll_gate = S.roll_k + IDX_KPOOL * IDX_HEAD_DIM;
     return S;
+}
+
+// Build VisionWeights out of the resident store. Lazy: an engine that never sees an image never
+// pays for the lookup, and one built with a reduced --n-layer never has the tensors at all.
+static bool build_vision(st::WeightStore* ws, VisionWeights& W) {
+    auto has = [&](const std::string& n) { return ws->has("model.visual." + n); };
+    if (!has("patch_embed.proj.weight") || !has("merger.down_proj.weight")) return false;
+    auto T = [&](const std::string& n) { return ws->get("model.visual." + n).dev; };
+    W.dtype = GEMV_BF16;
+    W.patch_embed = WRef(T("patch_embed.proj.weight"));
+    W.patch_embed_b = T("patch_embed.proj.bias");
+    for (int b = 0; b < VIS_DEPTH; ++b) {
+        const std::string p = "blocks." + std::to_string(b) + ".";
+        auto& B = W.blocks[b];
+        B.norm1 = T(p + "norm1.weight");
+        B.qkv = WRef(T(p + "attn.qkv.weight"));       B.qkv_b = T(p + "attn.qkv.bias");
+        B.q_norm = T(p + "attn.q_norm.weight");       B.k_norm = T(p + "attn.k_norm.weight");
+        B.proj = WRef(T(p + "attn.proj.weight"));     B.proj_b = T(p + "attn.proj.bias");
+        B.norm2 = T(p + "norm2.weight");
+        B.gate = WRef(T(p + "mlp.gate_proj.weight")); B.gate_b = T(p + "mlp.gate_proj.bias");
+        B.up   = WRef(T(p + "mlp.up_proj.weight"));   B.up_b   = T(p + "mlp.up_proj.bias");
+        B.down = WRef(T(p + "mlp.down_proj.weight")); B.down_b = T(p + "mlp.down_proj.bias");
+    }
+    W.post_layernorm = T("post_layernorm.weight");
+    W.downsample = WRef(T("downsample.weight"));  W.downsample_b = T("downsample.bias");
+    W.mg_proj = WRef(T("merger.proj.weight"));
+    W.mg_ln_w = T("merger.post_projection_norm.weight");
+    W.mg_ln_b = T("merger.post_projection_norm.bias");
+    W.mg_gate = WRef(T("merger.gate_proj.weight"));
+    W.mg_up   = WRef(T("merger.up_proj.weight"));
+    W.mg_down = WRef(T("merger.down_proj.weight"));
+    return true;
+}
+
+int Engine::encodeImage(const uint8_t* rgb, int h, int w, const float** dev, int max_image_tokens) {
+    if (!has_vision_) return 0;
+    if (!vw_) {
+        vw_ = new VisionWeights();
+        if (!build_vision(ws_, *vw_)) { delete vw_; vw_ = nullptr; has_vision_ = false; return 0; }
+    }
+    PreprocResult P = vision_preprocess_rgb(rgb, h, w, max_image_tokens);
+    const int S = P.grid_h * P.grid_w;
+    if (S <= 0 || (S & 3)) return 0;
+    const int NO = S / 4;
+
+    auto grow = [&](float** p, size_t* have, size_t want) {
+        if (*have >= want) return;
+        if (*p) cudaFree(*p);
+        CU(cudaMalloc(p, want * 4)); *have = want;
+    };
+    grow(&vis_in_,  &vis_in_n_,  (size_t)S * VIS_IN_DIM);
+    grow(&vis_ws_,  &vis_ws_n_,  vision_workspace_floats(S));
+    grow(&vis_out_, &vis_out_n_, (size_t)NO * VIS_OUT_HIDDEN);
+    grow(&vis_cos_, &vis_cos_n_, (size_t)S * VIS_HEAD_DIM);
+    grow(&vis_sin_, &vis_sin_n_, (size_t)S * VIS_HEAD_DIM);
+
+    std::vector<int> pos(2 * (size_t)S);
+    vision_position_ids(1, P.grid_h, P.grid_w, VIS_MERGE, pos.data());
+    std::vector<float> hc((size_t)S * VIS_HEAD_DIM), hs((size_t)S * VIS_HEAD_DIM);
+    vision_rope_tables(pos.data(), S, hc.data(), hs.data());
+
+    CU(cudaMemcpy(vis_in_, P.patches.data(), P.patches.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(vis_cos_, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(vis_sin_, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice));
+    vision_forward(vis_in_, vis_cos_, vis_sin_, *vw_, S, vis_out_, vis_ws_, 0);
+    CU(cudaDeviceSynchronize());
+    *dev = vis_out_;
+    return NO;
 }
 
 void Engine::set_image_embeds(int pos0, int n, const float* dev_emb) {

@@ -22,7 +22,7 @@ void vision_smart_resize(int h, int w, int factor, int temporal_factor,
 
 // Full path: RGB8 HWC -> canvas (fit + zero pad, or antialiased bicubic downscale when the budget
 // bites) -> rescale 1/255 -> CLIP normalize -> patchify.
-PreprocResult vision_preprocess_rgb(const uint8_t* rgb, int h, int w);
+PreprocResult vision_preprocess_rgb(const uint8_t* rgb, int h, int w, int max_tokens = 1024);
 
 // Patchify a CHW float image that is ALREADY resized and normalized. Split out because this half
 // is exact integer arithmetic and must match the oracle to the bit, while the resize half is
