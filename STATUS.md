@@ -153,10 +153,12 @@ weight — 2 bytes of x per byte of bf16 weight, but 7.1 per byte of NVFP4. That
    **`attn:mla` is no longer the laggard.** The largest remaining prefill rows are `ffn:moe`
    (priced over 100% of bandwidth — a known byte-model error, it counts M x 8 expert reads rather
    than the distinct count) and `attn:kda`.
-2. **The NVFP4 accuracy decision.** cos 0.9972 over three KDA layers against the PyTorch oracle;
-   uniform rel 0.088-0.100 per tensor, no family worse than another. Reverting a family is a
-   re-run of `tools/requant_dense_nvfp4.py --families`; `GLM5_DENSE_NVFP4=0` reverts all of it
-   with no file touched.
+2. ~~**The NVFP4 accuracy decision.**~~ **CLOSED** — OPTIMIZATION_LOG #18. Measured, not inferred
+   from a cosine: **+1.56% perplexity** (4.430457 -> 4.499673 over 47,195 tokens) and **90.101%
+   top-1 agreement**, but confident disagreements are **0.138%** of tokens. **Keep the overlay** —
+   +1.56% ppl for 1.42x decode. Quote those numbers, not the 0.9972 cosine, which implied a much
+   smaller effect than the measurement found. `GLM5_DENSE_NVFP4=0` still reverts with no file
+   touched.
 3. **Speculative decode** is unblocked in principle now that batch cost is sublinear in K, but
    ROOFLINE §4's curve should be re-measured against the fixed kernel before any head fine-tune.
 4. Still owed from before: long-context correctness above 2051 on the full model, and the
