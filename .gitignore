@@ -1,0 +1,6 @@
+# Build outputs and measurement logs are reproducible; keeping them out of the tree keeps a clone
+# usable. They were tracked up to this commit, so history still carries them.
+build/
+logs/
+*.o
+__pycache__/

@@ -1,8 +1,0 @@
-[server] tokenizer /home/patrickd/glm-5.3-reap/output/glm-5.3-flash-reap50-nvfp4-pass2/tokenizer.json
-[server] tokenizer ok (vocab 154820, 36 added, eos 154820/154827/154829)
-engine: 1410 tensors, 13.57 GiB resident, 4 layers, max_ctx 4096
-engine: 3 KDA layers (12.84 MiB state, context-independent), 1 full-attn layers (8.00 MiB latent cache at 4096 ctx)
-
-[server] listening on http://0.0.0.0:8178   (web UI at /)
-[server] model glm-5.3-flash-reap50-nvfp4, 4 layers, 13.60 GiB resident, max_ctx 4096
-[server] *** 4 of 45 layers loaded: this is a PLUMBING SMOKE TEST, the text is meaningless ***

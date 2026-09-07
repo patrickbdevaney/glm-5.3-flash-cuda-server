@@ -3,12 +3,16 @@
 A pure-CUDA inference server for **GLM-5.3-Flash-REAP50-NVFP4** on Jetson AGX Thor.
 No Python on the request path. Built for AR decode and MTP speculative decode.
 
-## Why
+## Why, and how that changed
 
-The draft head is already good — **72.26% depth-1 acceptance un-fine-tuned**. Speculation still
-*lost* on the GGUF build, because llama.cpp's batch cost is flat below 32 tokens, so a depth-K
-draft always lands on the slow side of the cliff. **The batch-cost curve is what decides whether
-speculation pays, and here it is ours to build.**
+This began as a speculative-decode engine: the native MTP draft head is good (**72.3% acceptance,
+un-fine-tuned**), and speculation lost on the GGUF build only because llama.cpp's batch cost is
+flat below 32 tokens. The batch curve here is ours to build, so the plan was to build a better one.
+
+**That plan was measured and it failed.** The curve was built, and speculation still loses — see
+"Speculation: closed" below. What the engine turned out to be good for is plain autoregressive
+decode, which it now does at 1.42x its own starting point. The MTP scaffolding
+(`forward_batch`, state-slot rollback, `SPEC_DECODE.md`) is built, gated and unused.
 
 ## What the checkpoint actually is
 
@@ -26,20 +30,49 @@ because 8 of 144 are read. Meanwhile **13.32 GiB of bf16 dense weights sit on th
 untouched** and account for 76% of `B_tok`. Quantising those halves `B_tok` (19.76 → 9.66 G) and
 doubles the AR wall (12.1 → 24.9 tok/s at the 240 GB/s measured on this box). See `ROOFLINE.md`.
 
-## State
+## State — measured, on this box
 
-| subsystem | % of `B_tok` | status |
-|---|---|---|
-| KDA linear attention | 47.4% | **gated cos 1.000000000** |
-| MoE (routed + shared + router) | 28.9% | **gated cos 1.000000000** |
-| MLA full attention | 13.1% | **gated cos 1.000000000** |
-| dense MLP + mHC + norms | 3.5% | **gated cos 1.000000000** |
-| lm_head | 6.4% | wired (gemv), gated via the engine |
-| DSA indexer | 0.8% | not built — **provably unnecessary below 2048 context** |
+| | |
+|---|---|
+| decode | **11.69 tok/s** (85.5 ms/step), 50% of a 23.5 tok/s roofline |
+| prefill | **47.8 ms/tok** at chunk 32 |
+| `B_tok` | **9.762 G/token** (19.761 before the NVFP4 dense overlay) |
+| perplexity | **4.4996** vs 4.4305 bf16 — the overlay costs **+1.56%** |
 
-Everything is gated against `transformers` **on real checkpoint weights**, never on synthetic
+All kernels are gated against `transformers` **on real checkpoint weights**, never on synthetic
 fixtures. That is not pedantry: both "misaligned address" faults in `OPTIMIZATION_LOG` #2 were
-invisible to `cudaMalloc`-backed buffers and fatal on the real model.
+invisible to `cudaMalloc`-backed buffers and fatal on the real model. `forward_batch` at M=1 is
+asserted **bit-identical** to sequential `decode()`, not merely close.
+
+### The NVFP4 dense overlay
+
+A 3.70 GiB side-car (not a checkpoint rewrite) that converts the bf16 dense weights on the AR path
+to NVFP4. Halves `B_tok`, buys **1.42x** on decode. It is not free, and the honest cost is not the
+cosine:
+
+| | |
+|---|---|
+| perplexity | +1.56% (47,195 tokens, identical ids both conditions) |
+| top-1 agreement | 90.101% |
+| **confident** disagreements (reference NLL < 0.5) | **0.138%** of tokens |
+
+The flips sit where the model was already unsure — median reference NLL 2.2054 on disagreements
+against 0.3547 on agreements. Per-tensor cosine was 0.9950-0.9972 and implied a much smaller
+effect than the measurement found; **quote the perplexity, not the cosine.** `GLM5_DENSE_NVFP4=0`
+reverts it with no file touched.
+
+### Speculation: closed
+
+The batch curve was built and then measured, in that order, which is the one thing the GGUF effort
+got wrong. A width-2 verify costs **2.164** AR steps, so at 72.3% acceptance every draft depth is a
+net loss (best 0.95x at depth 2), and the payoff is bounded at **1.27x even for a perfect drafter**.
+
+The cause is structural, not an implementation defect: with 144 experts at top-8, M tokens touch
+`144*(1-(1-8/144)^M)` distinct experts — still 7.4 per token at M=4 — so expert traffic is
+near-linear in M exactly where speculation needs it flat. Attention batches fine (0.46-0.54 at
+width 4); `ffn:moe` does not (0.82) and is ~45% of the step. **Fine-grained MoE is structurally
+hostile to speculative decoding at small draft depths.** No draft head fixes this; do not fine-tune
+one for this engine.
 
 ## Layout
 
@@ -68,9 +101,16 @@ cd ~/glm-5.3-flash-cuda-server && bash scripts/gate.sh
 
 ## Next
 
-1. Engine end-to-end on all 45 layers (needs ~98 GiB free; blocked while an unattended stage holds
-   the box).
-2. Tokenizer + HTTP/OpenAI server — ports from `~/deepseek-v4-flash-0731-cuda`.
-3. DSA indexer, to go past 2048 context.
-4. **Measure the batch-cost curve, then decide on speculation** — in that order, because the
-   reverse order is what wasted the effort on GGUF.
+1. **Vision.** The checkpoint ships a 24-block vision tower (`model.visual.*`, patch embed, merger,
+   downsample) and this server is **text-only** — there is no vision code in it at all. The GGUF
+   build has it; this does not. Largest capability gap.
+2. **Concurrent-request batching.** The server serialises on a global lock. The measured curve
+   gives **1.69x aggregate throughput at width 16**, and the memory is affordable precisely because
+   only 11 of 45 layers have a KV cache: per stream is 145.56 MiB of fixed KDA state plus
+   `11 * ctx * 512 * 4` of latent cache — 322 MiB at 8k, so 16 streams cost 5 GiB.
+3. **Long-context correctness above 2051.** The DSA sparse path is gated bit-exact *below*
+   `DENSE_CTX_LIMIT`; above it there is no dense answer to compare against. `tools/perplexity.cu
+   --concat` reports perplexity by position band, which is the available check.
+4. Decode is at 50% of roofline and the remaining gap is spread thin — `ffn:moe` at 66% of
+   bandwidth is the largest single block. Row tiling was swept (`NVFP4_R`): 5 is optimal, higher is
+   up to 3x worse, because `x` is 16 KB and L2-resident.

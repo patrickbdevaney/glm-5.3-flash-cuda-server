@@ -71,6 +71,12 @@ int main(int argc, char** argv) {
     std::string corpus = std::string(getenv("HOME")) + "/glm-5.3-reap/artifacts/iq3m_mtp_capture/corpus";
     std::string out;
     int nseq = 32, chunk = 32, minlen = 256, maxlen = 2000;
+    // --concat N: glue corpus sequences together into streams of at least N tokens, so the run
+    // crosses DENSE_CTX_LIMIT and exercises the DSA sparse path. Above that limit there is no
+    // dense answer to compare against (gate_mla_sparse can only assert bit-equality BELOW it), so
+    // the check is positional perplexity: with more context a correct model must not get WORSE.
+    // A broken sparse path spikes exactly at the boundary, which is a known-sign test.
+    int concat = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "--ckpt")   ec.model_dir = argv[++i];
@@ -80,8 +86,9 @@ int main(int argc, char** argv) {
         else if (a == "--min-len") minlen = atoi(argv[++i]);
         else if (a == "--max-len") maxlen = atoi(argv[++i]);
         else if (a == "--out")    out = argv[++i];
+        else if (a == "--concat") concat = atoi(argv[++i]);
     }
-    ec.max_ctx = maxlen + 16;
+    ec.max_ctx = (concat > 0 ? concat : maxlen) + 16;   // concatenated streams are the long case
     ec.max_batch = chunk;
     ec.n_layer = N_LAYER;
 
@@ -109,6 +116,16 @@ int main(int argc, char** argv) {
         }
         fclose(fl); fclose(fi);
     }
+    if (concat > 0) {
+        std::vector<std::vector<int>> merged;
+        std::vector<int> cur;
+        for (auto& s2 : seqs) {
+            cur.insert(cur.end(), s2.begin(), s2.end());
+            if ((int)cur.size() >= concat) { cur.resize(concat); merged.push_back(cur); cur.clear(); }
+        }
+        seqs.swap(merged);
+        printf("concatenated into %zu streams of %d tokens\n", seqs.size(), concat);
+    }
     if ((int)seqs.size() < nseq) { fprintf(stderr, "only %zu sequences available\n", seqs.size()); }
     if (seqs.empty()) { fprintf(stderr, "no corpus at %s\n", corpus.c_str()); return 2; }
 
@@ -125,6 +142,8 @@ int main(int argc, char** argv) {
 
     double tot_nll = 0; long tot_tok = 0;
     std::vector<float> h_nll; std::vector<int32_t> h_am;
+    // NLL bucketed by absolute position, in 512-token bands. DENSE_CTX_LIMIT falls inside band 4.
+    const int NB_ = 32; std::vector<double> bnll(NB_, 0); std::vector<long> bcnt(NB_, 0);
     for (size_t s = 0; s < seqs.size(); ++s) {
         const std::vector<int>& ids = seqs[s];
         const int n = (int)ids.size();
@@ -143,7 +162,11 @@ int main(int argc, char** argv) {
             std::vector<float> hn(rows); std::vector<int32_t> ha(rows);
             CU(cudaMemcpy(hn.data(), dnll, rows * 4, cudaMemcpyDeviceToHost));
             CU(cudaMemcpy(ha.data(), dam, rows * 4, cudaMemcpyDeviceToHost));
-            for (int i = 0; i < rows; ++i) { tot_nll += hn[i]; ++tot_tok; }
+            for (int i = 0; i < rows; ++i) {
+                tot_nll += hn[i]; ++tot_tok;
+                const int band = (t + i) / 512;
+                if (band < NB_) { bnll[band] += hn[i]; bcnt[band] += 1; }
+            }
             h_nll.insert(h_nll.end(), hn.begin(), hn.end());
             h_am.insert(h_am.end(), ha.begin(), ha.end());
         }
@@ -154,6 +177,16 @@ int main(int argc, char** argv) {
     }
     printf("\nTOKENS %ld   MEAN_NLL %.8f   PPL %.6f\n", tot_tok, tot_nll / tot_tok,
            exp(tot_nll / tot_tok));
+    {
+        printf("\nppl by position band (DENSE_CTX_LIMIT = %d; a correct sparse path must not\n"
+               "spike where the engine switches over):\n", DENSE_CTX_LIMIT);
+        for (int b = 0; b < NB_; ++b) if (bcnt[b]) {
+            const int lo = b * 512, hi = lo + 511;
+            printf("   pos %5d-%5d  n=%7ld  ppl %9.4f%s\n", lo, hi, bcnt[b],
+                   exp(bnll[b] / bcnt[b]),
+                   (lo <= DENSE_CTX_LIMIT && DENSE_CTX_LIMIT <= hi) ? "   <- switchover" : "");
+        }
+    }
     if (!out.empty()) {
         FILE* f = fopen(out.c_str(), "wb");
         if (f) { long n = (long)h_nll.size(); fwrite(&n, 8, 1, f);
