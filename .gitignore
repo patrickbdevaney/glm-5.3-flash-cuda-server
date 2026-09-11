@@ -8,3 +8,4 @@ __pycache__/
 # from history to get the repo under GitHub's 100 MB per-file limit; the generators are kept.
 ref/*.bin
 ref/**/*.bin
+*.bak
