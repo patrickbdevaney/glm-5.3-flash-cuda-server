@@ -96,9 +96,37 @@ def main():
     # a looping GLM scored against a low-effort DeepSeek, not a capability gap.
     ap.add_argument("--reasoning-effort", default="high", choices=["low", "high"],
                     help="sent in the request body; 'max'/unset is the degenerate path on glm5")
+    # RE-MEASURING ONLY THE TRUNCATED ROWS IS EXACT, NOT AN APPROXIMATION. Decoding here is
+    # greedy (temperature 0.0), so a completion that already terminated below the old cap emits
+    # the identical token sequence under any larger cap -- max_tokens only ever stops a sequence,
+    # it never steers one. So raising the budget can change ONLY the rows that hit the old cap.
+    # Re-running those and splicing them back over the previous result is therefore identical to
+    # re-running all 164, at a fraction of the GPU hours. It matters here because the dsv4 arm
+    # truncated 61/164 at 4096 while glm5 truncated 7, so a fixed-budget pass@1 was scoring token
+    # ECONOMY, not capability, and the fix would otherwise cost another 4-hour full sweep.
+    ap.add_argument("--only-truncated-in", default="",
+                    help="path to a prior result JSON; re-runs only its truncated task_ids and "
+                         "splices them over the untruncated rows, which greedy decoding leaves "
+                         "bit-identical")
     a = ap.parse_args()
     BASE = a.base
-    probs = load_problems(a.limit)
+    prior_rows = []
+    if a.only_truncated_in:
+        # --limit applies to the TRUNCATED SUBSET here, not to the 164, so a pilot slice is 6
+        # re-measured problems rather than 6 problems of which only one was truncated. Rows that
+        # are truncated but outside the slice are carried through unchanged and keep their own
+        # `truncated` flag, so a pilot result never silently reads as a clean full run.
+        probs = load_problems(0)
+        prior = json.loads(Path(a.only_truncated_in).read_text())
+        trunc_ids = [r["task_id"] for r in prior["rows"] if r["truncated"]]
+        rerun = set(trunc_ids[:a.limit] if a.limit else trunc_ids)
+        prior_rows = [r for r in prior["rows"] if r["task_id"] not in rerun]
+        probs = [p for p in probs if p["task_id"] in rerun]
+        print(f"SPLICE: carrying {len(prior_rows)} rows from {a.only_truncated_in} "
+              f"(prior budget {prior.get('max_tokens')}, {len(trunc_ids)} truncated), "
+              f"re-running {len(probs)}", flush=True)
+    else:
+        probs = load_problems(a.limit)
     print(f"HumanEval: {len(probs)} problems against {BASE} [{a.label}] "
           f"effort={a.reasoning_effort} max_tokens={a.max_tokens}", flush=True)
     rows, npass, ntrunc = [], 0, 0
@@ -135,12 +163,20 @@ def main():
         print(f"[{i+1}/{len(probs)}] {p['task_id']} {'PASS' if ok else 'fail'}  "
               f"{ct} tok{' TRUNC' if trunc else ''}  "
               f"running {npass}/{i+1} = {npass/(i+1):.1%}", flush=True)
+        # The spliced rows are the carried-over untruncated ones plus what this pass measured;
+        # with no --only-truncated-in, prior_rows is empty and this is the plain full-run result.
+        allr = prior_rows + rows
+        ap_ = sum(r["pass"] for r in allr); at_ = sum(r["truncated"] for r in allr)
         Path(a.out).write_text(json.dumps(
-            {"n": len(rows), "pass": npass, "pass@1": npass/len(rows),
-             "max_tokens": a.max_tokens, "truncated": ntrunc, "label": a.label,
+            {"n": len(allr), "pass": ap_, "pass@1": ap_/len(allr),
+             "max_tokens": a.max_tokens, "truncated": at_, "label": a.label,
              "reasoning_effort": a.reasoning_effort,
-             "rows": rows}, indent=1))
+             "spliced_from": a.only_truncated_in or None,
+             "carried_rows": len(prior_rows), "remeasured_rows": len(rows),
+             "rows": allr}, indent=1))
     dt = time.time() - t0
+    rows = prior_rows + rows
+    npass = sum(r["pass"] for r in rows); ntrunc = sum(r["truncated"] for r in rows)
     ct = sorted(r["completion_tokens"] for r in rows)
     def pct(q): return ct[min(len(ct) - 1, int(q * len(ct)))] if ct else 0
     print(f"\nHumanEval pass@1 = {npass}/{len(rows)} = {npass/len(rows):.1%}  ({dt/60:.0f} min)")
