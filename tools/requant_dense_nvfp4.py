@@ -85,12 +85,41 @@ FAMILIES = {
 }
 DEFAULT = 'kda_qkv,o_proj,lm_head,dense_mlp,mla,indexer,kda_gates'
 
+# ---- MiMo-V2.6-Flash ------------------------------------------------------------------------
+#
+# A SEPARATE TABLE, because the GLM patterns over-match here. `layers\.\d+\.self_attn\.o_proj`
+# is unanchored, and MiMo has three different stacks that all use `layers.N.self_attn.o_proj`:
+# the 48 backbone layers, 6 layers of `audio_encoder.input_local_transformer` (a 1024-dim tower),
+# and 3 `model.mtp` layers. Running the GLM table here would have quantised 57 tensors when 48
+# were wanted, silently taking the audio encoder to FP4 -- a format nobody has measured on it,
+# for a saving of 2.1 MB per tensor. Anchor to `^model\.layers\.` and make MTP opt-in.
+#
+# Note also that the GLM guard `'.visual.' in name` does NOT fire on MiMo, whose tower is
+# top-level `visual.blocks.N.attn.proj.weight` with no leading dot. It is excluded here by being
+# absent from every pattern rather than by that guard.
+#
+# Xiaomi fused q/k/v (`attention_projection_layout: "fused_qkv"`) and quantised it to F8_E4M3,
+# leaving o_proj BF16 on all 49 layers via `ignored_layers`. Measured 2026-09-23 on real weights
+# (layers 0/21/47) against GLM's o_proj, which we already ship as NVFP4: MiMo rel_fro 0.0940 /
+# row-cos 0.99550 vs GLM 0.0925 / 0.99560 -- INDISTINGUISHABLE. So the vendor's exclusion is not
+# a property of these weight distributions. FP8-e4m3 on the same tensors is 0.0266 / 0.99965,
+# i.e. 3.5x lower error for half the saving, which is the fallback if end-to-end ppl ever says
+# FP4 costs too much here.
+FAMILIES_MIMO = {
+    'o_proj':   r'^model\.layers\.\d+\.self_attn\.o_proj\.weight$',
+    'lm_head':  r'^lm_head\.weight$',
+    'mtp_o':    r'^model\.mtp\.layers\.\d+\.self_attn\.o_proj\.weight$',
+}
+DEFAULT_MIMO = 'o_proj'
+ARCHS = {'glm5': (FAMILIES, DEFAULT), 'mimo': (FAMILIES_MIMO, DEFAULT_MIMO)}
 
-def family_of(name, sel):
-    if '.visual.' in name or 'embed_tokens' in name:
+
+def family_of(name, sel, fams=None):
+    fams = fams if fams is not None else FAMILIES
+    if '.visual.' in name or name.startswith('visual.') or 'embed_tokens' in name:
         return None
     for f in sel:
-        if re.search(FAMILIES[f], name):
+        if re.search(fams[f], name):
             return f
     return None
 
@@ -138,15 +167,19 @@ def main():
         '~/glm-5.3-reap/output/glm-5.3-flash-reap50-nvfp4-pass2'))
     ap.add_argument('--out', default=os.path.expanduser(
         '~/glm-5.3-reap/output/glm-5.3-flash-dense-nvfp4-overlay'))
-    ap.add_argument('--families', default=DEFAULT)
+    ap.add_argument('--arch', default='glm5', choices=sorted(ARCHS),
+                    help='selects the family table; MiMo needs anchored patterns (see FAMILIES_MIMO)')
+    ap.add_argument('--families', default=None,
+                    help="default depends on --arch")
     ap.add_argument('--rows', type=int, default=8192, help='row block; bounds peak RSS')
     ap.add_argument('--shard-bytes', type=int, default=2 << 30)
     a = ap.parse_args()
 
-    sel = [f.strip() for f in a.families.split(',') if f.strip()]
+    fams, dflt = ARCHS[a.arch]
+    sel = [f.strip() for f in (a.families or dflt).split(',') if f.strip()]
     for f in sel:
-        if f not in FAMILIES:
-            sys.exit('unknown family %s; known: %s' % (f, ','.join(FAMILIES)))
+        if f not in fams:
+            sys.exit('unknown family %s for --arch %s; known: %s' % (f, a.arch, ','.join(fams)))
     os.makedirs(a.out, exist_ok=True)
 
     shards = sorted(f for f in os.listdir(a.model) if f.endswith('.safetensors'))
@@ -156,7 +189,7 @@ def main():
         for name, t in h.items():
             if name == '__metadata__' or t['dtype'] != 'BF16':
                 continue
-            fam = family_of(name, sel)
+            fam = family_of(name, sel, fams)
             if fam and len(t['shape']) == 2 and t['shape'][1] % GROUP == 0:
                 todo.append((sh, base, name, t, fam))
     tot_in = sum(np.prod(t['shape']) * 2 for _, _, _, t, _ in todo)
