@@ -1,0 +1,83 @@
+[
+ {
+  "target": 32000,
+  "tokens": 32036,
+  "depth": 0.1,
+  "found": true,
+  "secs": 1630.5,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 32000,
+  "tokens": 32036,
+  "depth": 0.5,
+  "found": true,
+  "secs": 1628.3,
+  "reply": "crimson-lantern-47\n\nThe secret passphrase for the Halvorsen archive is crimson-lantern-47",
+  "error": null
+ },
+ {
+  "target": 32000,
+  "tokens": 32036,
+  "depth": 0.9,
+  "found": true,
+  "secs": 1633.3,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 64000,
+  "tokens": 64036,
+  "depth": 0.1,
+  "found": true,
+  "secs": 3438.6,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 64000,
+  "tokens": 64036,
+  "depth": 0.5,
+  "found": true,
+  "secs": 3438.6,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 64000,
+  "tokens": 64036,
+  "depth": 0.9,
+  "found": true,
+  "secs": 3440.8,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 128000,
+  "tokens": 128036,
+  "depth": 0.1,
+  "found": true,
+  "secs": 7514.6,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 128000,
+  "tokens": 128036,
+  "depth": 0.5,
+  "found": true,
+  "secs": 7509.3,
+  "reply": "crimson-lantern-47.</think>The secret passphrase for the Halvorsen archive is crimson-lantern-",
+  "error": null
+ },
+ {
+  "target": 128000,
+  "tokens": 128036,
+  "depth": 0.9,
+  "found": true,
+  "secs": 7508.1,
+  "reply": "crimson-lantern-47. plan. Rainfall in the northern district has exceeded the seasonal average for three consecutive year",
+  "error": null
+ }
+]
