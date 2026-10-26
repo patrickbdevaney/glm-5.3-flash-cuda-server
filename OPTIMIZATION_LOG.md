@@ -1272,3 +1272,55 @@ request-scoped and the caller owns them; `reset()` no longer touches them.
 Lifetime note worth keeping: the SSE path hands generation to a chunked content provider that
 captures by value and runs *after* the handler returns, so the image buffers are held by a
 `shared_ptr` both paths share rather than a scope guard, which would have freed them mid-stream.
+
+---
+
+## KDA decode was launch-bound, not bandwidth-bound (2026-09-11)
+
+`fin_dec.log` priced `kda:gates` at **16.3 GB/s — 7% of achievable** while the MoE gemvs on either
+side of it ran at 66-70%. That is not a bandwidth number, it is a launch-latency number:
+`kda_gates` issued **7 kernels per layer x 34 layers = 238 launches per token** to move 2.7 MB, and
+`kda_qkv_conv` issued three separate `[Q, HIDDEN]` gemvs that all read the same `x`.
+
+`gemv_bs()` had already been tuned for exactly these shapes — its comment names `kda:gates` — and
+it did not fix it, which was the clue: the residue was the launch itself, not occupancy.
+
+**The change.** A `gemv_multi()` primitive that folds up to 4 independent `[N_i, K]` gemvs sharing
+K into one launch, one job per `blockIdx.y`, each job keeping its own `y`, `W`, `x` and `N`. The
+NVFP4 kernel body moved into a `__device__` function called by both launchers, so there is still
+exactly ONE reduction tree rather than a copy to keep in step. Plus `k_forget_gate` and `k_sigmoid`
+fused into `k_gate_tail`.
+
+    kda_gates      7 launches/layer -> 3        kda_qkv_conv   4 launches/layer -> 2
+
+**Bit-identity is the point, not a bonus.** A block still owns the same rows and sums them in the
+same order, so `tests/gate_gemv_multi.cu` asserts `memcmp` equality against the per-job `gemv()` on
+real overlay tensors — including the ragged-N group and the per-job-x group — with a poison fill and
+a degeneracy check so two all-zero buffers cannot pass. Speculative verification compares a batched
+forward against what the sequential path would have produced; "close" is not a comparison there.
+
+**Measured** (round-robin old/new x3, CLAUDE.md §6; min reported with median):
+
+| sub-op | old min ms | new min ms | ratio |
+|---|---:|---:|---:|
+| `kda:gates` | 92.10 | 54.41 | **0.591x** |
+| `kda:qkv+conv` | 436.38 | 390.38 | **0.895x** |
+| `attn:kda` | 747.42 | 664.44 | **0.889x** |
+| `kda:o_proj` *(untouched control)* | 162.63 | 163.00 | 1.002x |
+| `ffn:moe` *(untouched control)* | 875.35 | 865.13 | 0.988x |
+| **TOTAL** | **88.05** | **83.94** | **0.953x** |
+
+**11.36 -> 11.91 tok/s, +4.8%.** The two untouched ops sitting at 1.002x and 0.988x are what make
+this a measurement rather than a contention artifact.
+
+**The projection was wrong and it is worth saying why.** The estimate was +16%, from assuming the
+KDA projections could reach the MoE's ~160 GB/s once the launches were gone. They went 103.9 ->
+118.7 GB/s, not 160. Removing launch overhead recovered what launch overhead was costing; the rest
+of the gap to the MoE is the kernel's actual efficiency on tall-thin shapes, which fusion does not
+touch. **Launch overhead and kernel efficiency are separate terms, and only the first was fixed.**
+
+**What is left, in order.** `kda:o_proj` (215.77 ms, 8.1%, 95.2 GB/s) and `mla:o_proj` (190.38 ms,
+7.1%, 100.8 GB/s) are now the largest sub-160 GB/s terms. Neither can fuse — nothing else shares
+their `x` — so they need R/tiling work instead, which is a different lever from this one.
+`mla:indexer` (12.4 GB/s) and `mla:sdpa` (13.7 GB/s) are still launch-bound but are only 1.5%
+combined.

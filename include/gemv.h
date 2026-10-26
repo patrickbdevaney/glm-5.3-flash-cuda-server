@@ -27,6 +27,33 @@ struct WRef {
 
 // y[N] = W[N,K] @ x[K],  W row-major, x and y fp32.
 void gemv(float* y, const WRef& W, const float* x, int N, int K, int dtype, cudaStream_t s);
+
+// ---- gemv_multi ------------------------------------------------------------------------------
+//
+// Several INDEPENDENT gemvs that share K and dtype, issued as ONE launch.
+//
+// The KDA decode path is not weight-bandwidth-bound, it is LAUNCH-bound. kda_gates issues seven
+// kernels per layer x 34 layers = 238 launches per token to move 2.7 MB, and dprof measures it at
+// 16.3 GB/s -- 7% of achievable, while the MoE gemvs on either side reach 66-70%. gemv_bs() was
+// already tuned for these shapes (see its comment) and did not fix it, because the residue is the
+// launch itself, not occupancy.
+//
+// Each job keeps its own y, W, x and N. Nothing about a row's reduction changes -- a block still
+// owns the same rows and sums them in the same order -- so the result is BIT-IDENTICAL to calling
+// gemv() on each job in turn. tests/gate_gemv_multi.cu asserts exactly that on real checkpoint
+// weights, which is the gate that lets speculative verification keep using this path.
+//
+// Jobs whose W is not NVFP4, or a count outside 2..GEMV_MULTI_MAX, fall back to a gemv() loop:
+// correct, just not fused. In production every KDA/MLA projection is in the dense NVFP4 overlay,
+// so the fused path is the one that runs; the fallback covers the fp32 oracle gates.
+enum { GEMV_MULTI_MAX = 4 };
+struct GemvJob {
+    float*       y = nullptr;
+    WRef         W;
+    const float* x = nullptr;
+    int          N = 0;
+};
+void gemv_multi(const GemvJob* jobs, int n, int K, int dtype, cudaStream_t s);
 }
 
 // fp32 -> bf16 in place on device, for gates/benches that hold fp32 oracle weights but must

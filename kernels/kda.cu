@@ -96,6 +96,24 @@ __global__ void k_sigmoid(float* __restrict__ y, const float* __restrict__ x, in
     if (i < n) y[i] = 1.f / (1.f + __expf(-x[i]));
 }
 
+// k_forget_gate and k_sigmoid fused. Two launches of a few microseconds' work each are two launch
+// latencies; at 34 layers that was measurable next to the 2.7 MB kda_gates actually moves. The
+// arithmetic is copied verbatim from the two kernels above, so the result is bit-identical.
+// beta is updated in place and H <= Q, so the threads that touch beta are a subset of the ones
+// that touch g and each still owns exactly one element of each array -- no race, no ordering.
+__global__ void k_gate_tail(float* __restrict__ g, const float* __restrict__ f_hi,
+                            const float* __restrict__ dt_bias, const float* __restrict__ A_log,
+                            float* __restrict__ beta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < Q) {
+        const int h = i / D;
+        const float decay = __expf(A_log[h]);
+        const float v = decay * (f_hi[i] + dt_bias[i]);
+        g[i] = KDA_LOWER_BOUND / (1.f + __expf(-v));
+    }
+    if (i < H) beta[i] = 1.f / (1.f + __expf(-beta[i]));
+}
+
 // ---------------------------------------------------------------- l2 norm over head_dim
 // FLA convention: inv = sqrt(sum(x^2) + eps), x / inv.  NOT max(norm, eps) — the difference is
 // small but systematic, and matching it is why this gates instead of merely correlating.
@@ -217,9 +235,11 @@ __global__ void k_out_norm_bf16(float* __restrict__ normed, const float* __restr
 void kda_qkv_conv(const float* x, const KdaWeights& W, float* conv_state, float* qkv, float* ws,
                   cudaStream_t s) {
     float* q_raw = ws;
-    gemv(q_raw,         W.q_proj, x, Q, HIDDEN, W.dtype, s);
-    gemv(q_raw + Q,     W.k_proj, x, Q, HIDDEN, W.dtype, s);
-    gemv(q_raw + 2 * Q, W.v_proj, x, Q, HIDDEN, W.dtype, s);
+    // q, k and v are three [Q, HIDDEN] reads of the SAME x, so they are one launch, not three.
+    const GemvJob qkvj[3] = {{q_raw,         W.q_proj, x, Q},
+                             {q_raw + Q,     W.k_proj, x, Q},
+                             {q_raw + 2 * Q, W.v_proj, x, Q}};
+    gemv_multi(qkvj, 3, HIDDEN, W.dtype, s);
     const int C = 3 * Q;
     // conv weights are fp32 in the gate and bf16 in production; upconvert once at load, not here.
     k_conv_silu<<<(C + 255) / 256, 256, 0, s>>>(qkv, conv_state, conv_state, q_raw,
@@ -231,13 +251,18 @@ void kda_gates(const float* x, const KdaWeights& W, float* g, float* beta, float
     float* f_lo = ws;               // [128]
     float* g_lo = ws + 128;         // [128]
     float* f_hi = ws + 256;         // [Q]
-    gemv(f_lo, W.f_a, x, KDA_GATE_RANK, HIDDEN, W.dtype, s);
-    gemv(g_lo, W.g_a, x, KDA_GATE_RANK, HIDDEN, W.dtype, s);
-    gemv(f_hi, W.f_b, f_lo, Q, KDA_GATE_RANK, W.dtype, s);
-    gemv(gate, W.g_b, g_lo, Q, KDA_GATE_RANK, W.dtype, s);
-    k_forget_gate<<<(Q + 255) / 256, 256, 0, s>>>(g, f_hi, W.dt_bias, W.A_log);
-    gemv(beta, W.b_proj, x, H, HIDDEN, W.dtype, s);
-    k_sigmoid<<<1, H, 0, s>>>(beta, beta, H);
+    // Seven launches per layer x 34 layers moved 2.7 MB at 16.3 GB/s -- 7% of achievable, pure
+    // launch latency (fin_dec.log 2026-09-10). Three now. The low-rank legs (f_a, g_a, b_proj) all
+    // read x, so they fuse; the high-rank legs read f_lo and g_lo, which is why GemvJob carries a
+    // per-job x rather than a shared one. Same stream, so B still sees A's output.
+    const GemvJob lo[3] = {{f_lo, W.f_a,    x, KDA_GATE_RANK},
+                           {g_lo, W.g_a,    x, KDA_GATE_RANK},
+                           {beta, W.b_proj, x, H}};
+    gemv_multi(lo, 3, HIDDEN, W.dtype, s);
+    const GemvJob hi[2] = {{f_hi, W.f_b, f_lo, Q},
+                           {gate, W.g_b, g_lo, Q}};
+    gemv_multi(hi, 2, KDA_GATE_RANK, W.dtype, s);
+    k_gate_tail<<<(Q + 255) / 256, 256, 0, s>>>(g, f_hi, W.dt_bias, W.A_log, beta);
 }
 
 void kda_norm_qk(const float* qkv, float* q_n, float* k_n, cudaStream_t s) {

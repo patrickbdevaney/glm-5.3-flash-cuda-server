@@ -236,11 +236,19 @@ static inline int gemv_bs(int K) { return K <= 128 ? 32 : K <= 512 ? 64 : 256; }
 // k_gemm_nvfp4<BS, 1, R>, so forward_batch at M=1 being bit-identical to decode is structural
 // rather than a property that has to be re-argued after every edit. gate_batch still checks it.
 
+// The body lives in a __device__ function so that the single-matrix launcher and the fused
+// gemv_multi launcher share ONE reduction tree. Two copies of this loop would be a standing
+// obligation to keep them in step, and the bit-identity that speculative verification depends on
+// would become a property to re-argue after every edit instead of a structural fact.
+//
+// `blk` replaces blockIdx.x. The early-out is BLOCK-UNIFORM (n0 depends only on the block index),
+// so every thread takes it together and the __syncthreads() in the epilogue stay well-formed.
 template <int BS, int MB, int R>
-__global__ void k_gemm_nvfp4(float* __restrict__ y, const uint8_t* __restrict__ P,
+__device__ __forceinline__ void d_gemm_nvfp4(float* __restrict__ y, const uint8_t* __restrict__ P,
                              const uint8_t* __restrict__ Sc, const float* __restrict__ gs,
-                             const float* __restrict__ x, int N, int K) {
-    const int n0 = blockIdx.x * R;
+                             const float* __restrict__ x, int N, int K, int blk) {
+    const int n0 = blk * R;
+    if (n0 >= N) return;
     const int K8 = K >> 3;                      // one uint32 = 8 weights
     const size_t prow = (size_t)K >> 1, srow = (size_t)K >> 4;
 
@@ -313,6 +321,24 @@ __global__ void k_gemm_nvfp4(float* __restrict__ y, const uint8_t* __restrict__ 
     }
 }
 
+template <int BS, int MB, int R>
+__global__ void k_gemm_nvfp4(float* __restrict__ y, const uint8_t* __restrict__ P,
+                             const uint8_t* __restrict__ Sc, const float* __restrict__ gs,
+                             const float* __restrict__ x, int N, int K) {
+    d_gemm_nvfp4<BS, MB, R>(y, P, Sc, gs, x, N, K, blockIdx.x);
+}
+
+// One job per blockIdx.y. Passed BY VALUE: at 4 jobs this is 176 bytes of the 4 KB constant
+// parameter space, so it needs no device allocation and no extra copy on the critical path.
+struct NvJob { float* y; const uint8_t* P; const uint8_t* Sc; const float* gs; const float* x; int N; };
+struct NvJobs { NvJob j[GEMV_MULTI_MAX]; };
+
+template <int BS, int MB, int R>
+__global__ void k_gemm_nvfp4_multi(NvJobs jobs, int K) {
+    const NvJob j = jobs.j[blockIdx.y];
+    d_gemm_nvfp4<BS, MB, R>(j.y, j.P, j.Sc, j.gs, j.x, j.N, K, blockIdx.x);
+}
+
 // Rows per block. x traffic per weight is 4*MB/R bytes, so R has to grow with MB to hold it
 // under the 0.5625 bytes the weights themselves cost — but acc[R][MB] and xr[MB][8] both live in
 // registers, so R*MB is the budget and 8 is where it lands.
@@ -370,6 +396,44 @@ static void gemm_nvfp4(float* y, const WRef& W, const float* x, int M, int N, in
 }
 #undef NVFP4_LAUNCH
 #undef NVFP4_LAUNCH_BS
+
+// ---- gemv_multi ----------------------------------------------------------------------------
+// See include/gemv.h. MB is fixed at 1 (these are gemvs), so R is Rows<1>::v and the launch
+// geometry is (max blocks over the jobs, one job per blockIdx.y). Every job keeps the block size
+// the single-matrix path would have chosen, because nvfp4_bs() depends only on K and K is shared.
+void gemv_multi(const GemvJob* jobs, int n, int K, int dtype, cudaStream_t s) {
+    bool fuse = (n >= 2 && n <= GEMV_MULTI_MAX && (K & 15) == 0);
+    for (int i = 0; i < n && fuse; ++i)
+        if (!jobs[i].W.nvfp4() || jobs[i].N <= 0) fuse = false;
+    if (!fuse) {                       // correct, just not fused -- the fp32 oracle gates land here
+        for (int i = 0; i < n; ++i)
+            gemv(jobs[i].y, jobs[i].W, jobs[i].x, jobs[i].N, K, dtype, s);
+        return;
+    }
+    constexpr int R = Rows<1>::v;
+    NvJobs jd{};
+    int maxb = 0;
+    double bytes = 0;
+    for (int i = 0; i < n; ++i) {
+        jd.j[i] = { jobs[i].y, jobs[i].W.packed, jobs[i].W.scale, jobs[i].W.gscale,
+                    jobs[i].x, jobs[i].N };
+        const int b = (jobs[i].N + R - 1) / R;
+        if (b > maxb) maxb = b;
+        bytes += (double)jobs[i].N * K * 0.5625;
+    }
+    // Unused slots are never launched (gridDim.y == n), but give them N=0 anyway so that a future
+    // grid change cannot turn a stale pointer into a silent out-of-bounds read.
+    for (int i = n; i < GEMV_MULTI_MAX; ++i) { jd.j[i] = jd.j[0]; jd.j[i].N = 0; }
+    dprof_bytes(bytes);
+    const dim3 g(maxb, n);
+    switch (nvfp4_bs(K)) {
+        case 32:  k_gemm_nvfp4_multi<32,  1, R><<<g, 32,  0, s>>>(jd, K); break;
+        case 64:  k_gemm_nvfp4_multi<64,  1, R><<<g, 64,  0, s>>>(jd, K); break;
+        case 128: k_gemm_nvfp4_multi<128, 1, R><<<g, 128, 0, s>>>(jd, K); break;
+        default:  k_gemm_nvfp4_multi<256, 1, R><<<g, 256, 0, s>>>(jd, K); break;
+    }
+}
+
 
 #define GEMV_LAUNCH(BS)                                                                          \
     do {                                                                                         \
