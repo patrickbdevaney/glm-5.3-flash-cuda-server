@@ -1,6 +1,6 @@
 // bench_kda.cu — what fraction of achievable bandwidth does the KDA decode step reach?
 //
-// KDA is 47.4% of B_tok (ROOFLINE.md §1), so its bandwidth efficiency very nearly IS the engine's.
+// KDA is 47.4% of B_tok (docs/ROOFLINE.md §1), so its bandwidth efficiency very nearly IS the engine's.
 // The byte model below is exact — it counts what the kernels are obliged to move, nothing else —
 // so "% of achievable" here is an honest number, not an ncu-derived one (CLAUDE.md §3).
 #include "kda.h"

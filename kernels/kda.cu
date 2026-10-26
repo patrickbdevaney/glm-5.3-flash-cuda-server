@@ -1,6 +1,6 @@
 // kda.cu — Kimi Delta Attention, decode step (batch 1).
 //
-// 34 of 45 layers are KDA and they are 47.4% of per-token bandwidth (ROOFLINE.md §1), so this
+// 34 of 45 layers are KDA and they are 47.4% of per-token bandwidth (docs/ROOFLINE.md §1), so this
 // file is the single largest cost centre in the engine. Two very different problems live here:
 //
 //   * the projections (q/k/v/o_proj, 4 x [8192, 4096]) — pure streaming, handled by gemv.cu;
@@ -58,7 +58,7 @@ size_t kda_batch_workspace_floats(int M) { return (size_t)M * (13 * (size_t)Q + 
 // The window is read into registers before anything is written, so `st_in == st_out` (the ordinary
 // in-place autoregressive case) behaves exactly as it did. Separate pointers exist so a
 // multi-token forward can leave one window per position instead of one at the end — see
-// SPEC_DECODE.md: a rejected draft has to return to an earlier state, and a recurrence has no
+// docs/SPEC_DECODE.md: a rejected draft has to return to an earlier state, and a recurrence has no
 // inverse to apply.
 __global__ void k_conv_silu(float* __restrict__ out, const float* __restrict__ st_in,
                             float* __restrict__ st_out,
@@ -353,7 +353,7 @@ void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, floa
 // autoregression. Non-zero means token m reads slot m and writes slot m+1, leaving one state per
 // position at no extra bandwidth — the same volume is read and written either way, just to a
 // different address. That is what makes a rejected speculative draft free to roll back
-// (SPEC_DECODE.md); with in-place updates there is nothing to roll back to.
+// (docs/SPEC_DECODE.md); with in-place updates there is nothing to roll back to.
 void kda_batch_step_slots(const float* x, const KdaWeights& W,
                           float* conv_state, size_t conv_stride,
                           float* S, size_t state_stride,

@@ -607,7 +607,7 @@ void Engine::decode(int token_id, int pos, float* logits, cudaStream_t s) {
 // Chunked through forward_batch, which is the whole reason that kernel exists. A sequential
 // prefill pays the full 19.76 GB weight read for EVERY prompt token; a chunk of C amortises the
 // 15.005 GB non-expert half across all C of them, so cost per token falls from 19.76 GB to
-// 15.005/C + 4.756 GB — 8.5 GB at C=4, 5.2 GB at C=32 (ROOFLINE.md §4). That is 2.3x to 3.8x on
+// 15.005/C + 4.756 GB — 8.5 GB at C=4, 5.2 GB at C=32 (docs/ROOFLINE.md §4). That is 2.3x to 3.8x on
 // the single largest cost a request pays before its first token.
 //
 // lm_head runs only for the LAST prompt token, and only on the last chunk: it is 6.4% of B_tok,

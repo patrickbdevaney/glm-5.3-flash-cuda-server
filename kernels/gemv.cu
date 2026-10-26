@@ -3,7 +3,7 @@
 // y[n] = sum_k W[n, k] * x[k],  W row-major [N, K].
 //
 // At decode this kernel IS the model: 76% of B_tok is dense weights streamed through here exactly
-// once per token (ROOFLINE.md §1). The only thing that matters is reading W at close to peak
+// once per token (docs/ROOFLINE.md §1). The only thing that matters is reading W at close to peak
 // bandwidth; the arithmetic is one FMA per element and never binds.
 //
 // Layout: one BLOCK per output row, blockDim.x threads striding K. Rows are contiguous in memory

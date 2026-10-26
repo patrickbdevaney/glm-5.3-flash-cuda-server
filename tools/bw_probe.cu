@@ -1,5 +1,5 @@
 // bw_probe.cu — streaming-bandwidth microbenchmark + an ncu smoke target.
-// Measures achievable read bandwidth on the unified pool, which ROOFLINE.md currently
+// Measures achievable read bandwidth on the unified pool, which docs/ROOFLINE.md currently
 // carries as an INHERITED ~200 GB/s planning figure rather than a measurement.
 //   nvcc -O3 -arch=sm_110a tools/bw_probe.cu -o build/bw_probe
 #include <cstdio>

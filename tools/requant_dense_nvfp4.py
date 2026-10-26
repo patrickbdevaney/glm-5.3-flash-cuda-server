@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""requant_dense_nvfp4.py — the B_tok lever (ROOFLINE.md §3).
+"""requant_dense_nvfp4.py — the B_tok lever (docs/ROOFLINE.md §3).
 
 13.3 GiB of bf16 dense weights sit on the AR path untouched and are 76% of B_tok. REAP+NVFP4
 quantised the *experts* — 83% of the disk, 24% of the bytes per token. This quantises what is

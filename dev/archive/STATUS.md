@@ -12,8 +12,8 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 
 | stage | state |
 |---|---|
-| architecture mapped from the checkpoint | **done** — `ARCH_DELTA.md` |
-| roofline measured | **done** — `ROOFLINE.md`, `tools/roofline.py` |
+| architecture mapped from the checkpoint | **done** — `../../docs/ARCH_DELTA.md` |
+| roofline measured | **done** — `../../docs/ROOFLINE.md`, `tools/roofline.py` |
 | port verdict per subsystem | **done** — one NEW (KDA), three RETARGET, rest PORT |
 | **KDA** (47.4% of `B_tok`) | **gated cosine-1.0**, 15/15, both dtypes — `tests/gate_kda.cu` |
 | **MoE** (28.9%) | **gated cosine-1.0**, real packed NVFP4 from the shards — `tests/gate_moe.cu` |
@@ -29,7 +29,7 @@ batch-cost curve is the thing that decides whether any of this pays, and here it
 | **chat encoder** | **gated byte-exact vs HF's own Jinja**, 42/42 — `tests/gate_encoding.cpp` |
 | **sampler / stream / API** | **gated**, 44 checks, no GPU needed |
 | **HTTP server** | **running** — OpenAI chat + completions, SSE, tools, prefix reuse; 19/19 live smoke |
-| MTP + speculative decode | designed and costed, not built — `SPEC_DECODE.md` |
+| MTP + speculative decode | designed and costed, not built — `../../docs/SPEC_DECODE.md` |
 | **full 45-layer engine** | **RUNNING** — 57,604 tensors, 98.49 GiB resident, loads in ~80 s; serves coherent text |
 
 **The context limit is gone.** A 4,073-token prompt now serves end to end; the engine ran dense
@@ -82,18 +82,18 @@ bad sizing costs a restart rather than the session.
 2. **Widen `gate_stack` to layer 3** against the PyTorch oracle — *blocked*, the oracle needs ~20
    GiB for layer 3's experts. Note `gate_batch` now runs MLA and MoE inside the engine loop, so
    what remains uncovered is their absolute wiring, not their consistency.
-3. **Speculative decode**, per `SPEC_DECODE.md`. Step 1 there — rolling back the KDA recurrence —
+3. **Speculative decode**, per `../../docs/SPEC_DECODE.md`. Step 1 there — rolling back the KDA recurrence —
    is **done and gated**. Steps 2-4 (load layer 45, the draft step, the draft-verify loop) need the
    full model and are blocked.
 4. **Resolve pre-norm vs post-norm for the MTP block's `h_prev`** before any head fine-tuning. Two
-   lines, and getting it wrong would be baked into the fine-tune (`SPEC_DECODE.md`).
+   lines, and getting it wrong would be baked into the fine-tune (`../../docs/SPEC_DECODE.md`).
 6. **Batch the routed experts** — worth 4.7% at verify widths, 1.9x for wide prefill chunks. Do it
    for prefill, not for speculation.
 
 **Not yet measured:** `tools/bench_batch` has never had an uncontended run. Two attempts landed
 while the box was at 97% GPU, and the first reported K=2 as faster than K=1 in absolute
 ms/forward — arithmetically impossible. The methodology is fixed (round-robin widths, minimum over
-32 reps, an in-process bandwidth probe) but the number is still owed, and `ROOFLINE.md` §4 remains
+32 reps, an in-process bandwidth probe) but the number is still owed, and `../../docs/ROOFLINE.md` §4 remains
 an analytic prediction rather than a measurement. See `CLAUDE.md` §6.
 
 ## Two things the build has already changed

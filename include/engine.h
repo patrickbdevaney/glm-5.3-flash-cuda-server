@@ -29,7 +29,7 @@ struct EngineConfig {
     // Recurrent-state slots. 1 = ordinary autoregression, updated in place, no extra memory.
     // Speculation needs draft_width+1: token m of a verify writes slot m+1, so slot j holds the
     // state after exactly j tokens and rejecting K-j drafts is a pointer move rather than an
-    // impossible rewind (SPEC_DECODE.md). Each slot is 145.56 MiB at the full 45 layers.
+    // impossible rewind (docs/SPEC_DECODE.md). Each slot is 145.56 MiB at the full 45 layers.
     int  state_slots = 1;
     bool verbose    = true;
 };
@@ -89,7 +89,7 @@ public:
     //
     // This is the kernel the whole repo turns on. Weights are read ONCE for all M — a K-wide
     // forward costs 15.005 G plus whichever routed experts the K tokens select, not K x 19.76 G
-    // (ROOFLINE.md §4). It is what makes prefill affordable AND what makes speculative
+    // (docs/ROOFLINE.md §4). It is what makes prefill affordable AND what makes speculative
     // verification cheaper than just decoding the tokens, which is the only reason a draft head
     // can pay for itself.
     //

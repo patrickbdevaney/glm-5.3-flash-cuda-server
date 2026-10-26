@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
     //
     // A verify runs K drafted tokens through one forward. If only j are accepted, the engine has
     // to return to the state after j — and 34 of 45 layers are a RECURRENCE, which has no inverse
-    // and nothing to truncate. The fix (SPEC_DECODE.md) is to have the recurrence write slot m+1
+    // and nothing to truncate. The fix (docs/SPEC_DECODE.md) is to have the recurrence write slot m+1
     // while reading slot m, so slot j simply IS the state after j tokens.
     //
     // What this checks is that the claim is true: snapshot a 5-wide forward, accept only j of it,

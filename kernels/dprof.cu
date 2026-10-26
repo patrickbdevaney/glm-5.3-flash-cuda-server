@@ -27,7 +27,7 @@ static const char* kName[DP_N] = {
     "    moe:router", "    moe:w13+act", "    moe:w2+combine",
 };
 
-// Bytes of WEIGHT read per decoded token, from ROOFLINE.md §1 (safetensors headers, not estimates).
+// Bytes of WEIGHT read per decoded token, from docs/ROOFLINE.md §1 (safetensors headers, not estimates).
 // Zero means "this phase moves no meaningful weight bytes" -- for those a GB/s figure would be
 // noise, so the report prints a dash instead of a number that invites a wrong conclusion.
 //

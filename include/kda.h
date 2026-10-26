@@ -53,7 +53,7 @@ void kda_batch_step(const float* x, const KdaWeights& W, float* conv_state, floa
 // The same, but leaving one state per position instead of one at the end. Strides are in FLOATS;
 // zero means update in place (identical to kda_batch_step). Token m reads slot m and writes slot
 // m+1, so slot j is exactly the state after j tokens — which is what lets a speculative verify
-// that accepts only j of K drafted tokens roll back for free. See SPEC_DECODE.md.
+// that accepts only j of K drafted tokens roll back for free. See docs/SPEC_DECODE.md.
 void kda_batch_step_slots(const float* x, const KdaWeights& W,
                           float* conv_state, size_t conv_stride,
                           float* S, size_t state_stride,

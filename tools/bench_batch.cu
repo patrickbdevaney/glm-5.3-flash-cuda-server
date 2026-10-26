@@ -1,6 +1,6 @@
 // bench_batch.cu — the batch-cost curve, measured.
 //
-// ROOFLINE.md §4 predicts it analytically and flags one assumption it cannot prove: that a gemm at
+// docs/ROOFLINE.md §4 predicts it analytically and flags one assumption it cannot prove: that a gemm at
 // M>1 holds the same DRAM bandwidth as the gemv at M=1. If it does not, every speculation number
 // in that table is optimistic. This measures it.
 //
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
                base / (mn / K));
     }
 
-    printf("\n'vs K=1' is what ROOFLINE.md §4 predicts as the cost column; 'speedup' is the\n"
+    printf("\n'vs K=1' is what docs/ROOFLINE.md §4 predicts as the cost column; 'speedup' is the\n"
            "ceiling a verify of that width could reach if every drafted token were accepted.\n"
            "If min and med differ by more than ~15%%, the box was contended and this run is not a\n"
            "measurement — repeat it when the GPU is idle.\n");

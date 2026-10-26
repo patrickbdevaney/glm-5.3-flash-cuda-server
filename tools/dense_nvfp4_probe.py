@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dense_nvfp4_probe.py - does the 51% B_tok lever actually CONVERT?
 
-ROOFLINE.md §3: 13.32 GiB of bf16 dense weights sit on the AR path untouched and are 76% of
+docs/ROOFLINE.md §3: 13.32 GiB of bf16 dense weights sit on the AR path untouched and are 76% of
 B_tok. Quantising them to NVFP4 halves B_tok and doubles the AR wall. That is an arithmetic
 claim about bytes. This asks the question that decides whether it is usable:
 
@@ -146,7 +146,7 @@ def main():
     print('Read this as: if the state cosine degrades much faster than the per-tensor cosines,')
     print('the recurrence is amplifying quantisation error and q/k/v_proj should stay bf16 even')
     print('though o_proj and the MLP can go. Quantise in the order lm_head -> o_proj -> q/k/v,')
-    print('gating perplexity at each step (ROOFLINE.md §3).')
+    print('gating perplexity at each step (docs/ROOFLINE.md §3).')
 
 
 if __name__ == '__main__':

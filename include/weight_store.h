@@ -50,7 +50,7 @@ private:
         //   cudaMallocManaged + PreferredLoc   231.3 / 235.1       <- what this is now
         //
         // The kernels were never at 70% of achievable; they were at ~90% of a ceiling the weights
-        // could not exceed, and ROOFLINE.md's "% of achievable" column was measured against a
+        // could not exceed, and docs/ROOFLINE.md's "% of achievable" column was measured against a
         // buffer the model does not live in. Managed memory with the preferred location set to the
         // device and the range prefetched is device-resident on this integrated part, so it keeps
         // the single-copy property (no mmap+device doubling, no OOM) at device bandwidth.

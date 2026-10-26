@@ -38,7 +38,7 @@ on real checkpoint weights**, not on random tensors.
 
 Bandwidth, batch-cost curves, tok/s — all measured here (`tools/bw_probe.cu`, `tools/roofline.py`).
 The one figure carried in from a sibling repo is 240 GB/s achievable / 212 contended, and it was
-measured on **this** Thor. `ROOFLINE.md` says which numbers are measured and which are derived.
+measured on **this** Thor. `docs/ROOFLINE.md` says which numbers are measured and which are derived.
 
 **`ncu`'s "Memory Throughput %" is not DRAM bandwidth utilisation on Thor** — a kernel
 independently measured at 89% of spec reports ~30%. Bandwidth utilisation stays analytical
